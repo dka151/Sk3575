@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<SharedDataSet xmlns="http://schemas.microsoft.com/sqlserver/reporting/2010/01/shareddatasetdefinition" xmlns:rd="http://schemas.microsoft.com/SQLServer/reporting/reportdesigner">
+  <Description />
+  <DataSet Name="ServerGroupName">
+    <Query>
+      <DataSourceReference>DBMonitor</DataSourceReference>
+      <CommandType>StoredProcedure</CommandType>
+      <CommandText>DBMonitor.dbo.rServerGroup</CommandText>
+    </Query>
+    <Fields>
+      <Field Name="ServerGroupID">
+        <DataField>ServerGroupID</DataField>
+        <rd:TypeName>System.Int32</rd:TypeName>
+      </Field>
+      <Field Name="ServerGroupName">
+        <DataField>ServerGroupName</DataField>
+        <rd:TypeName>System.String</rd:TypeName>
+      </Field>
+    </Fields>
+  </DataSet>
+</SharedDataSet>
