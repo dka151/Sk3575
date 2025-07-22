@@ -1327,8 +1327,8 @@
   </Page>
   <AutoRefresh>0</AutoRefresh>
   <DataSources>
-    <DataSource Name="DBA">
-      <DataSourceReference>DBA</DataSourceReference>
+    <DataSource Name="DBMonitor">
+      <DataSourceReference>DBMOnitor</DataSourceReference>
       <rd:SecurityType>None</rd:SecurityType>
       <rd:DataSourceID>cb8799d3-96da-4804-bf94-31d429882b58</rd:DataSourceID>
     </DataSource>
@@ -1336,7 +1336,7 @@
   <DataSets>
     <DataSet Name="DBGrowthStats">
       <Query>
-        <DataSourceName>DBA</DataSourceName>
+        <DataSourceName>DBMonitor</DataSourceName>
         <QueryParameters>
           <QueryParameter Name="@DateFrom">
             <Value>=Parameters!DateFrom.Value</Value>
@@ -1349,7 +1349,7 @@
           </QueryParameter>
         </QueryParameters>
         <CommandType>StoredProcedure</CommandType>
-        <CommandText>REPORT.rTableGrowthStats</CommandText>
+        <CommandText>dbo.rTableGrowthStats</CommandText>
       </Query>
       <Fields>
         <Field Name="ServerID">
