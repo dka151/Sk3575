@@ -50,7 +50,7 @@
       <DataType>String</DataType>
       <DefaultValue>
         <Values>
-          <Value>C:\Reports\MerchHierarchyHilco.csv</Value>
+          <Value>H:\SFTP_CLR\SO_058_WSS_MerchHierarchyHilco_SFTP_Testing.csv</Value>
         </Values>
       </DefaultValue>
       <Prompt>Local File Path</Prompt>
@@ -59,7 +59,7 @@
       <DataType>String</DataType>
       <DefaultValue>
         <Values>
-          <Value>/Hilco Global/MerchHierarchyHilco.csv</Value>
+          <Value>/Hilco Global/SO_058_WSS_MerchHierarchyHilco_SFTP_Testing.csv</Value>
         </Values>
       </DefaultValue>
       <Prompt>Remote File Path</Prompt>
