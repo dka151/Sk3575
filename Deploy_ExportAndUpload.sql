@@ -23,6 +23,7 @@ BEGIN
     DECLARE @bcpCmd NVARCHAR(4000);
     DECLARE @result INT;
     DECLARE @dbName NVARCHAR(128) = DB_NAME();
+    DECLARE @errorLog NVARCHAR(500) = REPLACE(@localFilePath, '.csv', '_error.log');
 
     -- Step 1: Export CSV header
     DECLARE @headerCmd NVARCHAR(4000);
@@ -35,17 +36,17 @@ BEGIN
         RETURN;
     END
 
-    -- Step 2: Export data using bcp (append to file after header)
-    SET @bcpCmd = 'bcp "SELECT Divisionlabel,Dept,SubDept,Class,ExtendedColDesc,style_code,SKU,long_desc,size_code,Vendor,Brand,season_code,Cost,MSRP,SellingPrice,PriceStatus FROM ' + @dbName + '.mer.MerchHierarchy_Hilco" queryout "' + @localFilePath + '.tmp" -c -t"," -T -S ' + @@SERVERNAME;
+    -- Step 2: Export data using bcp via stored procedure
+    SET @bcpCmd = 'bcp "EXEC ' + @dbName + '.mer.MerchHierarchy_Hilco" queryout "' + @localFilePath + '.tmp" -c -t"," -T -S ' + @@SERVERNAME + ' -e "' + @errorLog + '"';
 
-    EXEC @result = xp_cmdshell @bcpCmd, no_output;
+    EXEC @result = xp_cmdshell @bcpCmd;
     IF @result <> 0
     BEGIN
-        SELECT 'ERROR: BCP export failed' AS Result;
+        SELECT 'ERROR: BCP export failed. Check ' + @errorLog AS Result;
         RETURN;
     END
 
-    -- Append data to header file
+    -- Append data to header file and clean up temp file
     DECLARE @appendCmd NVARCHAR(4000);
     SET @appendCmd = 'type "' + @localFilePath + '.tmp" >> "' + @localFilePath + '" & del "' + @localFilePath + '.tmp"';
     EXEC xp_cmdshell @appendCmd, no_output;
@@ -55,7 +56,7 @@ BEGIN
     DECLARE @zipCmd NVARCHAR(4000);
     SET @zipCmd = 'powershell -Command "Compress-Archive -Path ''' + @localFilePath + ''' -DestinationPath ''' + @zipPath + ''' -Force"';
 
-    EXEC @result = xp_cmdshell @zipCmd, no_output;
+    EXEC @result = xp_cmdshell @zipCmd;
     IF @result <> 0
     BEGIN
         SELECT 'ERROR: Failed to zip CSV file' AS Result;
