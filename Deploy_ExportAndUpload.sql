@@ -2,7 +2,7 @@
 -- Export CSV + SFTP Upload Combined Procedure
 -- =============================================
 
-USE [WSS_ATOS];
+USE [WSS_APTOS];
 GO
 
 IF EXISTS (SELECT * FROM sys.objects WHERE name = 'ExportAndUploadToSFTP' AND type = 'P')
@@ -16,13 +16,14 @@ CREATE PROCEDURE dbo.ExportAndUploadToSFTP
     @password NVARCHAR(100),
     @localFilePath NVARCHAR(500),
     @remoteFilePath NVARCHAR(500)
+WITH EXECUTE AS OWNER
 AS
 BEGIN
     SET NOCOUNT ON;
 
     DECLARE @bcpCmd NVARCHAR(4000);
     DECLARE @dbName NVARCHAR(128) = DB_NAME();
-    DECLARE @logFile NVARCHAR(500) = REPLACE(@localFilePath, '.csv', '.log');
+    DECLARE @logFile NVARCHAR(500) = 'H:\SFTP_CLR\SFTP_UPLOAD_SO_058_WSS_MerchHierarchyHilco.log';
     DECLARE @logCmd NVARCHAR(4000);
     DECLARE @timestamp NVARCHAR(50) = CONVERT(NVARCHAR(50), GETDATE(), 121);
 
@@ -81,7 +82,7 @@ BEGIN
     SET @logCmd = 'echo [' + @timestamp + '] Step 2: Running BCP export >> "' + @logFile + '"';
     EXEC xp_cmdshell @logCmd, no_output;
 
-    SET @bcpCmd = 'bcp "EXEC ' + @dbName + '.mer.MerchHierarchy_Hilco_test" queryout "' + @localFilePath + '.tmp" -c -t"," -T -S ' + @@SERVERNAME;
+    SET @bcpCmd = 'bcp "EXEC ' + @dbName + '.mer.MerchHierarchy_Hilco" queryout "' + @localFilePath + '.tmp" -c -t"," -T -S ' + @@SERVERNAME;
 
     -- Log the bcp command
     SET @logCmd = 'echo [' + @timestamp + '] BCP Command: ' + @bcpCmd + ' >> "' + @logFile + '"';
@@ -191,7 +192,17 @@ BEGIN
     SET @logCmd = 'echo [' + @timestamp + '] ExportAndUploadToSFTP completed successfully >> "' + @logFile + '"';
     EXEC xp_cmdshell @logCmd, no_output;
 
-    SELECT 'SUCCESS: File exported, zipped, and uploaded. Log: ' + @logFile AS Result;
+    -- Step 6: Delete the CSV file after successful upload
+    SET @logCmd = 'echo [' + @timestamp + '] Step 6: Deleting CSV file >> "' + @logFile + '"';
+    EXEC xp_cmdshell @logCmd, no_output;
+
+    DECLARE @deleteCmd NVARCHAR(4000) = 'del "' + @localFilePath + '"';
+    EXEC xp_cmdshell @deleteCmd, no_output;
+
+    SET @logCmd = 'echo [' + @timestamp + '] Step 6: CSV file deleted successfully >> "' + @logFile + '"';
+    EXEC xp_cmdshell @logCmd, no_output;
+
+    SELECT 'SUCCESS: File exported, zipped, and uploaded. CSV deleted. Log: ' + @logFile AS Result;
 END
 GO
 
