@@ -1,0 +1,67 @@
+-- =============================================
+-- Export CSV + SFTP Upload Combined Procedure
+-- =============================================
+
+USE [YourDatabaseName]; -- CHANGE THIS TO YOUR DATABASE NAME
+GO
+
+IF EXISTS (SELECT * FROM sys.objects WHERE name = 'ExportAndUploadToSFTP' AND type = 'P')
+    DROP PROCEDURE dbo.ExportAndUploadToSFTP;
+GO
+
+CREATE PROCEDURE dbo.ExportAndUploadToSFTP
+    @host NVARCHAR(255),
+    @port INT,
+    @username NVARCHAR(100),
+    @password NVARCHAR(100),
+    @localFilePath NVARCHAR(500),
+    @remoteFilePath NVARCHAR(500)
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    DECLARE @bcpCmd NVARCHAR(4000);
+    DECLARE @result INT;
+    DECLARE @dbName NVARCHAR(128) = DB_NAME();
+
+    -- Step 1: Export CSV header
+    DECLARE @headerCmd NVARCHAR(4000);
+    SET @headerCmd = 'echo Divisionlabel,Dept,SubDept,Class,ExtendedColDesc,style_code,SKU,long_desc,size_code,Vendor,Brand,season_code,Cost,MSRP,SellingPrice,PriceStatus > "' + @localFilePath + '"';
+
+    EXEC @result = xp_cmdshell @headerCmd, no_output;
+    IF @result <> 0
+    BEGIN
+        SELECT 'ERROR: Failed to write CSV header' AS Result;
+        RETURN;
+    END
+
+    -- Step 2: Export data using bcp (append to file after header)
+    SET @bcpCmd = 'bcp "SELECT Divisionlabel,Dept,SubDept,Class,ExtendedColDesc,style_code,SKU,long_desc,size_code,Vendor,Brand,season_code,Cost,MSRP,SellingPrice,PriceStatus FROM ' + @dbName + '.mer.MerchHierarchy_Hilco" queryout "' + @localFilePath + '.tmp" -c -t"," -T -S ' + @@SERVERNAME;
+
+    EXEC @result = xp_cmdshell @bcpCmd, no_output;
+    IF @result <> 0
+    BEGIN
+        SELECT 'ERROR: BCP export failed' AS Result;
+        RETURN;
+    END
+
+    -- Append data to header file
+    DECLARE @appendCmd NVARCHAR(4000);
+    SET @appendCmd = 'type "' + @localFilePath + '.tmp" >> "' + @localFilePath + '" & del "' + @localFilePath + '.tmp"';
+    EXEC xp_cmdshell @appendCmd, no_output;
+
+    -- Step 3: Upload to SFTP
+    EXEC dbo.UploadToSFTP
+        @host = @host,
+        @port = @port,
+        @username = @username,
+        @password = @password,
+        @localFilePath = @localFilePath,
+        @remoteFilePath = @remoteFilePath;
+
+    SELECT 'SUCCESS: File exported and uploaded' AS Result;
+END
+GO
+
+PRINT 'ExportAndUploadToSFTP procedure created successfully!';
+GO
