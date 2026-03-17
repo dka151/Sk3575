@@ -50,16 +50,30 @@ BEGIN
     SET @appendCmd = 'type "' + @localFilePath + '.tmp" >> "' + @localFilePath + '" & del "' + @localFilePath + '.tmp"';
     EXEC xp_cmdshell @appendCmd, no_output;
 
-    -- Step 3: Upload to SFTP
+    -- Step 3: Zip the CSV file
+    DECLARE @zipPath NVARCHAR(500) = REPLACE(@localFilePath, '.csv', '.zip');
+    DECLARE @zipCmd NVARCHAR(4000);
+    SET @zipCmd = 'powershell -Command "Compress-Archive -Path ''' + @localFilePath + ''' -DestinationPath ''' + @zipPath + ''' -Force"';
+
+    EXEC @result = xp_cmdshell @zipCmd, no_output;
+    IF @result <> 0
+    BEGIN
+        SELECT 'ERROR: Failed to zip CSV file' AS Result;
+        RETURN;
+    END
+
+    -- Step 4: Upload zip to SFTP
+    DECLARE @remoteZipPath NVARCHAR(500) = REPLACE(@remoteFilePath, '.csv', '.zip');
+
     EXEC dbo.UploadToSFTP
         @host = @host,
         @port = @port,
         @username = @username,
         @password = @password,
-        @localFilePath = @localFilePath,
-        @remoteFilePath = @remoteFilePath;
+        @localFilePath = @zipPath,
+        @remoteFilePath = @remoteZipPath;
 
-    SELECT 'SUCCESS: File exported and uploaded' AS Result;
+    SELECT 'SUCCESS: File exported, zipped, and uploaded' AS Result;
 END
 GO
 
