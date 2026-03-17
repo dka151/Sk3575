@@ -45,6 +45,7 @@
         </Values>
       </DefaultValue>
       <Prompt>SFTP Password</Prompt>
+      <Hidden>true</Hidden>
     </ReportParameter>
     <ReportParameter Name="LocalFilePath">
       <DataType>String</DataType>
@@ -79,7 +80,7 @@
       <Query>
         <DataSourceName>azusw1dwsql03</DataSourceName>
         <CommandType>StoredProcedure</CommandType>
-        <CommandText>mer.MerchHierarchy_Hilco</CommandText>
+        <CommandText>mer.MerchHierarchy_Hilco_test</CommandText>
       </Query>
       <Fields>
         <Field Name="Divisionlabel">

@@ -57,6 +57,22 @@ BEGIN
         RETURN;
     END
 
+    -- Verify CSV file was created
+    TRUNCATE TABLE #CmdOutput;
+    DECLARE @checkCsv NVARCHAR(4000) = 'if exist "' + @localFilePath + '" (echo EXISTS) else (echo MISSING)';
+
+    INSERT INTO #CmdOutput (OutputLine)
+    EXEC xp_cmdshell @checkCsv;
+
+    IF NOT EXISTS (SELECT 1 FROM #CmdOutput WHERE OutputLine LIKE '%EXISTS%')
+    BEGIN
+        SET @logCmd = 'echo [' + @timestamp + '] ERROR: CSV file was not created at ' + @localFilePath + ' >> "' + @logFile + '"';
+        EXEC xp_cmdshell @logCmd, no_output;
+        SELECT 'ERROR: CSV file not created. See log: ' + @logFile AS Result;
+        DROP TABLE #CmdOutput;
+        RETURN;
+    END
+
     SET @logCmd = 'echo [' + @timestamp + '] Step 1: CSV header written successfully >> "' + @logFile + '"';
     EXEC xp_cmdshell @logCmd, no_output;
     TRUNCATE TABLE #CmdOutput;
@@ -65,7 +81,7 @@ BEGIN
     SET @logCmd = 'echo [' + @timestamp + '] Step 2: Running BCP export >> "' + @logFile + '"';
     EXEC xp_cmdshell @logCmd, no_output;
 
-    SET @bcpCmd = 'bcp "EXEC ' + @dbName + '.mer.MerchHierarchy_Hilco" queryout "' + @localFilePath + '.tmp" -c -t"," -T -S ' + @@SERVERNAME;
+    SET @bcpCmd = 'bcp "EXEC ' + @dbName + '.mer.MerchHierarchy_Hilco_test" queryout "' + @localFilePath + '.tmp" -c -t"," -T -S ' + @@SERVERNAME;
 
     -- Log the bcp command
     SET @logCmd = 'echo [' + @timestamp + '] BCP Command: ' + @bcpCmd + ' >> "' + @logFile + '"';
