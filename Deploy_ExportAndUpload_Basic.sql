@@ -145,7 +145,7 @@ BEGIN
     EXEC xp_cmdshell @logCmd, no_output;
 
     DECLARE @alignCmd NVARCHAR(4000);
-    SET @alignCmd = 'powershell -Command "Get-Content ''' + @localFilePath + '.tmp''' | ForEach-Object { $fields = ($_ -split '','') | ForEach-Object { $v = $_.TrimStart(); if ($v -like ''*,*'') { $v = '''''''''' + $v + '''''''''' }; $v }; if ($fields[12]) { $fields[12] = if ($fields[12] -like '''''''''''*'''''''''''') { $fields[12].Substring(1, $fields[12].Length-2); ''''''''"$'''' + $fields[12].Substring(1, $fields[12].Length-2) + ''''''''"'''' } else { ''''''''$'''' + $fields[12] } }; if ($fields[13]) { $fields[13] = if ($fields[13] -like '''''''''''*'''''''''''') { ''''''''"$'''' + $fields[13].Substring(1, $fields[13].Length-2) + ''''''''"'''' } else { ''''''''$'''' + $fields[13] } }; if ($fields[14]) { $fields[14] = if ($fields[14] -like '''''''''''*'''''''''''') { ''''''''"$'''' + $fields[14].Substring(1, $fields[14].Length-2) + ''''''''"'''' } else { ''''''''$'''' + $fields[14] } }; $fields -join '','' } | Out-File -FilePath ''' + @localFilePath + '.tmp2''' -Encoding ASCII"';
+    SET @alignCmd = 'powershell -ExecutionPolicy Bypass -File "H:\SFTP_CLR\ProcessCSV.ps1" -InputFile "' + @localFilePath + '.tmp" -OutputFile "' + @localFilePath + '.tmp2"';
 
     INSERT INTO #CmdOutput (OutputLine)
     EXEC xp_cmdshell @alignCmd;

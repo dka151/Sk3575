@@ -145,7 +145,7 @@ BEGIN
     EXEC xp_cmdshell @logCmd, no_output;
 
     DECLARE @alignCmd NVARCHAR(4000);
-    SET @alignCmd = 'powershell -Command "& { $reader = [System.IO.File]::OpenText(''''' + @localFilePath + '.tmp'''''); $writer = [System.IO.StreamWriter]::new(''''' + @localFilePath + '.tmp2'''''); while ($null -ne ($line = $reader.ReadLine())) { $fields = $line -split '''',''''; for ($i = 0; $i -lt $fields.Length; $i++) { $fields[$i] = $fields[$i].TrimStart(); if ($fields[$i] -match '''','''') { $fields[$i] = '''''''''''''' + $fields[$i] + '''''''''''''' }; if ($i -eq 12 -or $i -eq 13 -or $i -eq 14) { if ($fields[$i]) { if ($fields[$i].StartsWith(''''''''''''''''''''')) { $fields[$i] = '''''''''''''''$'''' + $fields[$i].Substring(1, $fields[$i].Length - 2) + '''''''''''''' } else { $fields[$i] = ''''''''$'''' + $fields[$i] } } } }; $writer.WriteLine($fields -join '''','''') }; $reader.Close(); $writer.Close() }"';
+    SET @alignCmd = 'powershell -ExecutionPolicy Bypass -File "H:\SFTP_CLR\ProcessCSV.ps1" -InputFile "' + @localFilePath + '.tmp" -OutputFile "' + @localFilePath + '.tmp2"';
 
     INSERT INTO #CmdOutput (OutputLine)
     EXEC xp_cmdshell @alignCmd;

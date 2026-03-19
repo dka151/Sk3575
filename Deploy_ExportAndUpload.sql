@@ -26,6 +26,8 @@ BEGIN
     DECLARE @logFile NVARCHAR(500) = 'H:\SFTP_CLR\SFTP_UPLOAD_SO_058_WSS_MerchHierarchyHilco.log';
     DECLARE @logCmd NVARCHAR(4000);
     DECLARE @timestamp NVARCHAR(50) = CONVERT(NVARCHAR(50), GETDATE(), 121);
+    DECLARE @executionTime NVARCHAR(50) = 'ExecutionTime: ' + CONVERT(NVARCHAR(50), GETDATE(), 108);
+    DECLARE @executionDate NVARCHAR(100) = 'Executed: ' + DATENAME(WEEKDAY, GETDATE()) + ', ' + DATENAME(MONTH, GETDATE()) + ' ' + CAST(DAY(GETDATE()) AS NVARCHAR) + ', ' + CAST(YEAR(GETDATE()) AS NVARCHAR);
 
     -- Temp table to capture xp_cmdshell output
     CREATE TABLE #CmdOutput (LineId INT IDENTITY(1,1), OutputLine NVARCHAR(4000));
@@ -34,13 +36,31 @@ BEGIN
     SET @logCmd = 'echo [' + @timestamp + '] ExportAndUploadToSFTP started > "' + @logFile + '"';
     EXEC xp_cmdshell @logCmd, no_output;
 
-    -- Step 1: Export CSV header
-    SET @logCmd = 'echo [' + @timestamp + '] Step 1: Writing CSV header >> "' + @logFile + '"';
+    -- Step 1: Write execution details and CSV header
+    SET @logCmd = 'echo [' + @timestamp + '] Step 1: Writing execution details and CSV header >> "' + @logFile + '"';
     EXEC xp_cmdshell @logCmd, no_output;
 
-    DECLARE @headerCmd NVARCHAR(4000);
-    SET @headerCmd = 'echo Divisionlabel,Dept,SubDept,Class,ExtendedColDesc,style_code,SKU,long_desc,size_code,Vendor,Brand,season_code,Cost,MSRP,SellingPrice,PriceStatus > "' + @localFilePath + '"';
+    -- Write execution time (first row)
+    DECLARE @execTimeCmd NVARCHAR(4000);
+    SET @execTimeCmd = 'echo ' + @executionTime + ' > "' + @localFilePath + '"';
+    INSERT INTO #CmdOutput (OutputLine)
+    EXEC xp_cmdshell @execTimeCmd;
 
+    -- Write execution date (second row)
+    DECLARE @execDateCmd NVARCHAR(4000);
+    SET @execDateCmd = 'echo ' + @executionDate + ' >> "' + @localFilePath + '"';
+    INSERT INTO #CmdOutput (OutputLine)
+    EXEC xp_cmdshell @execDateCmd;
+
+    -- Write empty row (third row)
+    DECLARE @emptyRowCmd NVARCHAR(4000);
+    SET @emptyRowCmd = 'echo. >> "' + @localFilePath + '"';
+    INSERT INTO #CmdOutput (OutputLine)
+    EXEC xp_cmdshell @emptyRowCmd;
+
+    -- Write header row (fourth row)
+    DECLARE @headerCmd NVARCHAR(4000);
+    SET @headerCmd = 'echo Divisionlabel|Dept|SubDept|Class|ExtendedColDesc|style_code|size_code|SKU|long_desc|Vendor1|Brand|season_code|Cost|MSRP|SellingPrice|PriceStatus >> "' + @localFilePath + '"';
     INSERT INTO #CmdOutput (OutputLine)
     EXEC xp_cmdshell @headerCmd;
 
@@ -82,7 +102,7 @@ BEGIN
     SET @logCmd = 'echo [' + @timestamp + '] Step 2: Running BCP export >> "' + @logFile + '"';
     EXEC xp_cmdshell @logCmd, no_output;
 
-    SET @bcpCmd = 'bcp "EXEC ' + @dbName + '.mer.MerchHierarchy_Hilco" queryout "' + @localFilePath + '.tmp" -c -t"," -T -S ' + @@SERVERNAME;
+    SET @bcpCmd = 'bcp "EXEC ' + @dbName + '.mer.MerchHierarchy_Hilco" queryout "' + @localFilePath + '.tmp" -c -t"|" -T -S ' + @@SERVERNAME;
 
     -- Log the bcp command
     SET @logCmd = 'echo [' + @timestamp + '] BCP Command: ' + @bcpCmd + ' >> "' + @logFile + '"';
@@ -119,12 +139,24 @@ BEGIN
     EXEC xp_cmdshell @logCmd, no_output;
     TRUNCATE TABLE #CmdOutput;
 
-    -- Append data to header file and clean up temp file
-    SET @logCmd = 'echo [' + @timestamp + '] Step 2b: Appending data to CSV >> "' + @logFile + '"';
+    -- Step 2b: Left-align all fields and add $ to price columns in BCP output
+    SET @logCmd = 'echo [' + @timestamp + '] Step 2b: Left-aligning fields and formatting prices >> "' + @logFile + '"';
+    EXEC xp_cmdshell @logCmd, no_output;
+
+    DECLARE @alignCmd NVARCHAR(4000);
+    SET @alignCmd = 'powershell -Command "$reader = [System.IO.File]::OpenText(''''' + @localFilePath + '.tmp'''''); $writer = [System.IO.StreamWriter]::new(''''' + @localFilePath + '.tmp2'''''); while ($null -ne ($line = $reader.ReadLine())) { $f = $line -split ''''''''\|''''''''; for ($i=0; $i -lt $f.Length; $i++) { $f[$i] = $f[$i].TrimStart(); if ($i -eq 12 -or $i -eq 13 -or $i -eq 14) { if ($f[$i]) { $f[$i] = ''''''''$'''''''' + $f[$i] } } }; $writer.WriteLine($f -join ''''''''|'''''''') }; $reader.Close(); $writer.Close()"';
+
+    INSERT INTO #CmdOutput (OutputLine)
+    EXEC xp_cmdshell @alignCmd;
+
+    TRUNCATE TABLE #CmdOutput;
+
+    -- Append aligned data to header file and clean up temp files
+    SET @logCmd = 'echo [' + @timestamp + '] Step 2c: Appending data to CSV >> "' + @logFile + '"';
     EXEC xp_cmdshell @logCmd, no_output;
 
     DECLARE @appendCmd NVARCHAR(4000);
-    SET @appendCmd = 'type "' + @localFilePath + '.tmp" >> "' + @localFilePath + '" & del "' + @localFilePath + '.tmp"';
+    SET @appendCmd = 'type "' + @localFilePath + '.tmp2" >> "' + @localFilePath + '" & del "' + @localFilePath + '.tmp" & del "' + @localFilePath + '.tmp2"';
 
     INSERT INTO #CmdOutput (OutputLine)
     EXEC xp_cmdshell @appendCmd;
