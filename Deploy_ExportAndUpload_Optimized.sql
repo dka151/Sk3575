@@ -103,7 +103,7 @@ BEGIN
     SET @logCmd = 'echo [' + @timestamp + '] Step 2: Running BCP export >> "' + @logFile + '"';
     EXEC xp_cmdshell @logCmd, no_output;
 
-    SET @bcpCmd = 'bcp "EXEC ' + @dbName + '.mer.MerchHierarchy_Hilco" queryout "' + @localFilePath + '.tmp" -c -t"," -T -S ' + @@SERVERNAME;
+    SET @bcpCmd = 'bcp "EXEC ' + @dbName + '.mer.MerchHierarchy_Hilco" queryout "' + @localFilePath + '.tmp" -c -t"|" -T -S ' + @@SERVERNAME;
 
     -- Log the bcp command
     SET @logCmd = 'echo [' + @timestamp + '] BCP Command: ' + @bcpCmd + ' >> "' + @logFile + '"';

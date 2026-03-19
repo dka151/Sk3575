@@ -7,13 +7,14 @@ $reader = [System.IO.File]::OpenText($InputFile)
 $writer = [System.IO.StreamWriter]::new($OutputFile)
 
 while ($null -ne ($line = $reader.ReadLine())) {
-    $fields = $line -split ','
+    # Split by pipe delimiter (BCP output)
+    $fields = $line -split '\|'
     
     for ($i = 0; $i -lt $fields.Length; $i++) {
         # Left-align by trimming leading spaces
         $fields[$i] = $fields[$i].TrimStart()
         
-        # Quote fields that contain commas
+        # Quote fields that contain commas for CSV output
         if ($fields[$i] -match ',') {
             $fields[$i] = '"' + $fields[$i] + '"'
         }
@@ -31,6 +32,7 @@ while ($null -ne ($line = $reader.ReadLine())) {
         }
     }
     
+    # Join with comma for CSV output
     $writer.WriteLine($fields -join ',')
 }
 
