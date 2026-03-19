@@ -145,7 +145,7 @@ BEGIN
     EXEC xp_cmdshell @logCmd, no_output;
 
     DECLARE @alignCmd NVARCHAR(4000);
-    SET @alignCmd = 'powershell -Command "$reader = [System.IO.File]::OpenText(''' + @localFilePath + '.tmp''); $writer = [System.IO.StreamWriter]::new(''' + @localFilePath + '.tmp2''); while ($null -ne ($line = $reader.ReadLine())) { $f = $line -split '',''; for ($i=0; $i -lt $f.Length; $i++) { $f[$i] = $f[$i].TrimStart(); if ($f[$i] -like ''*,*'') { $f[$i] = '''''''''' + $f[$i] + '''''''''' }; if ($i -eq 12 -or $i -eq 13 -or $i -eq 14) { if ($f[$i]) { if ($f[$i] -like '''''''''''*'''''''''''') { $f[$i] = '''''''''''$'''' + $f[$i].Substring(1, $f[$i].Length-2) + '''''''''' } else { $f[$i] = ''''''''$'''' + $f[$i] } } } }; $writer.WriteLine($f -join '','') }; $reader.Close(); $writer.Close()"';
+    SET @alignCmd = 'powershell -Command "$reader = [System.IO.File]::OpenText(''''' + @localFilePath + '.tmp'''''); $writer = [System.IO.StreamWriter]::new(''''' + @localFilePath + '.tmp2'''''); while ($null -ne ($line = $reader.ReadLine())) { $f = $line -split '''',''''; for ($i=0; $i -lt $f.Length; $i++) { $f[$i] = $f[$i].TrimStart(); if ($f[$i] -like ''''*,*'''') { $f[$i] = '''''''''''''' + $f[$i] + '''''''''''''' }; if ($i -eq 12 -or $i -eq 13 -or $i -eq 14) { if ($f[$i]) { if ($f[$i] -like ''''''''''''*'''''''''''') { $f[$i] = ''''''''''''$'''' + $f[$i].Substring(1, $f[$i].Length-2) + '''''''''''''' } else { $f[$i] = ''''''''$'''' + $f[$i] } } } }; $writer.WriteLine($f -join '''','''') }; $reader.Close(); $writer.Close()"';
 
     INSERT INTO #CmdOutput (OutputLine)
     EXEC xp_cmdshell @alignCmd;
