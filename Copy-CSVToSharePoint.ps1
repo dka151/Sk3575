@@ -13,7 +13,7 @@
 
 param(
     [Parameter(Mandatory)]
-    [string]$Username,       # e.g. user@footlocker.com
+    [string]$Username,       # e.g. DOMAIN\username
 
     [Parameter(Mandatory)]
     [string]$Password
