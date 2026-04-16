@@ -16,11 +16,14 @@ param(
     [string]$Username,       # e.g. DOMAIN\username
 
     [Parameter(Mandatory)]
-    [string]$Password
+    [string]$Password,
+
+    [Parameter(Mandatory)]
+    [string]$FileName        # e.g. test.csv
 )
 
 # ── Configuration ─────────────────────────────────────────────────────────────
-$SourceFile     = "\\fileserver\shares\DBA\test.csv"
+$SourceFile     = "\\fileserver\shares\DBA\$FileName"
 $SharePointSite = "https://footlocker.sharepoint.com/sites/MerchandisingDepartment"
 $TargetFolder   = "Shared Documents/Planning/Data Connections"
 
