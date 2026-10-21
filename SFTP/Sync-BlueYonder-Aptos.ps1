@@ -23,8 +23,11 @@
     New-BlueYonderAptosCreds.ps1 WHILE RUNNING AS THE SERVICE ACCOUNT ON vwpsftp01
     (DPAPI ties each file to the creating user + machine).
 
-    SSH host keys are pinned via fingerprints. Capture them once with:
-        winscp.com /keygen /scanhostkey <host>
+    SSH host keys are pinned via fingerprints. Capture them once with the WinSCP
+    .NET assembly, e.g.:
+        Add-Type -Path 'C:\Program Files (x86)\WinSCP\WinSCPnet.dll'
+        $o = New-Object WinSCP.SessionOptions -Property @{ Protocol=[WinSCP.Protocol]::Sftp; HostName='<host>'; PortNumber=22 }
+        (New-Object WinSCP.Session).ScanFingerprint($o, 'SHA-256')
 
 .PARAMETER Mode
     Which flow(s) to run: Both (default), InvoicesOnly, or PosOnly.
@@ -77,7 +80,7 @@ $BlueYonder = @{
     HostName       = 'PRODB2BGW02.jdadelivers.com'
     PortNumber     = 22
     CredFile       = Join-Path $CredentialFolder 'blueyonder.cred.xml'
-    SshHostKey     = 'TODO-PASTE-BLUEYONDER-HOSTKEY-FINGERPRINT'   # winscp.com /keygen /scanhostkey PRODB2BGW02.jdadelivers.com
+    SshHostKey     = 'TODO-PASTE-BLUEYONDER-HOSTKEY-FINGERPRINT'   # scan with WinSCP ScanFingerprint (see header) for PRODB2BGW02.jdadelivers.com
     OutboxPath     = '/home/europatprdv2/outbox'   # invoices come FROM here
     InboxPath      = '/home/europatprdv2/inbox'    # POs go TO here
 }
@@ -87,7 +90,7 @@ $Aptos = @{
     HostName        = '10.252.16.100'
     PortNumber      = 22
     CredFile        = Join-Path $CredentialFolder 'aptos.cred.xml'
-    SshHostKey      = 'TODO-PASTE-APTOS-HOSTKEY-FINGERPRINT'       # winscp.com /keygen /scanhostkey 10.252.16.100
+    SshHostKey      = 'TODO-PASTE-APTOS-HOSTKEY-FINGERPRINT'       # scan with WinSCP ScanFingerprint (see header) for 10.252.16.100
     InvoicesInPath  = '/Transfer/IN/Merch/Invoices/Company1'      # invoices go TO here
     PurchaseOutPath = '/Transfer/Out/Merch/PurchaseOrder'         # POs come FROM here
 }
@@ -129,7 +132,7 @@ function New-WinScpSession {
     $cred = Get-StoredCredential -Path $Endpoint.CredFile -Role $Role
 
     if ($Endpoint.SshHostKey -like 'TODO*') {
-        throw "$Role SSH host key fingerprint is not set. Capture it with: winscp.com /keygen /scanhostkey $($Endpoint.HostName)  then paste it into the config."
+        throw "$Role SSH host key fingerprint is not set. Capture it with WinSCP ScanFingerprint for $($Endpoint.HostName) (see script header), then paste it into the config."
     }
 
     $opts = New-Object WinSCP.SessionOptions -Property @{

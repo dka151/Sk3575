@@ -64,13 +64,33 @@ Both must show `TcpTestSucceeded : True`. If Aptos fails, raise a firewall
 request: source = vwpsftp01 IP, destination = `10.252.16.100`, port 22/TCP.
 
 ### 3. Capture SSH host key fingerprints, then paste into the script
+Use the WinSCP .NET assembly's `ScanFingerprint` (no credentials needed, works
+on all recent versions):
 ```powershell
-& "C:\Program Files (x86)\WinSCP\WinSCP.com" /keygen /scanhostkey PRODB2BGW02.jdadelivers.com
-& "C:\Program Files (x86)\WinSCP\WinSCP.com" /keygen /scanhostkey 10.252.16.100
+Add-Type -Path "C:\Program Files (x86)\WinSCP\WinSCPnet.dll"
+foreach ($h in 'PRODB2BGW02.jdadelivers.com', '10.252.16.100') {
+    $opts = New-Object WinSCP.SessionOptions -Property @{
+        Protocol = [WinSCP.Protocol]::Sftp; HostName = $h; PortNumber = 22
+    }
+    $session = New-Object WinSCP.Session
+    try { Write-Host "$h  ->  $($session.ScanFingerprint($opts, 'SHA-256'))" }
+    finally { $session.Dispose() }
+}
+```
+Alternatively, with the WinSCP command-line client (prints the fingerprint in
+its output; `-hostkey=*` accepts any key just for the scan):
+```powershell
+& "C:\Program Files (x86)\WinSCP\WinSCP.com" /command `
+  "open sftp://PRODB2BGW02.jdadelivers.com/ -hostkey=*" "exit"
+& "C:\Program Files (x86)\WinSCP\WinSCP.com" /command `
+  "open sftp://10.252.16.100/ -hostkey=*" "exit"
 ```
 Put each returned fingerprint into the matching `SshHostKey` field in
 `Sync-BlueYonder-Aptos.ps1`. This pins the server identity and prevents
 man-in-the-middle connections.
+
+> Note: `/keygen /scanhostkey` is NOT valid — `/keygen` only converts key files.
+> Scanning requires TCP reachability, so scan Aptos only after step 2 passes.
 
 ### 4. Create encrypted credential files AS THE SERVICE ACCOUNT
 DPAPI ties each file to the creating user + machine, so this MUST run as the
@@ -88,10 +108,13 @@ Lock down `C:\sftp\creds` so only the service account and admins can read it.
 Run as the service account:
 ```powershell
 cd C:\sftp
-.\Sync-BlueYonder-Aptos.ps1 -WhatIf        # lists what WOULD move, moves nothing
-.\Sync-BlueYonder-Aptos.ps1                # real run, COPY (non-destructive)
+.\Sync-BlueYonder-Aptos.ps1 -WhatIf              # lists what WOULD move, moves nothing
+.\Sync-BlueYonder-Aptos.ps1                      # real run, COPY (non-destructive)
+.\Sync-BlueYonder-Aptos.ps1 -DeleteSourceAfter   # real run, MOVE (deletes source after verified upload)
 ```
 Check `C:\sftp\logs\blueyonder-aptos.log` and confirm files landed on both sides.
+Run the `-DeleteSourceAfter` (move) command only once you are satisfied the copy
+runs are landing correctly — this matches the production/scheduled behaviour.
 
 ### 6. Register the scheduled task (as administrator)
 ```powershell
