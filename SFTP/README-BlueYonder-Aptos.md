@@ -64,27 +64,37 @@ Both must show `TcpTestSucceeded : True`. If Aptos fails, raise a firewall
 request: source = vwpsftp01 IP, destination = `10.252.16.100`, port 22/TCP.
 
 ### 3. Capture SSH host key fingerprints, then paste into the script
-Use the WinSCP .NET assembly's `ScanFingerprint` (no credentials needed, works
-on all recent versions):
+Use the WinSCP .NET assembly's `ScanFingerprint` (no credentials needed).
+Run ONE HOST AT A TIME so pasted line breaks can't merge statements — keep each
+`New-Object` on its own line (merging them onto one line causes
+"A positional parameter cannot be found" errors).
+
+Blue Yonder:
 ```powershell
 Add-Type -Path "C:\Program Files (x86)\WinSCP\WinSCPnet.dll"
-foreach ($h in 'PRODB2BGW02.jdadelivers.com', '10.252.16.100') {
-    $opts = New-Object WinSCP.SessionOptions -Property @{
-        Protocol = [WinSCP.Protocol]::Sftp; HostName = $h; PortNumber = 22
-    }
-    $session = New-Object WinSCP.Session
-    try { Write-Host "$h  ->  $($session.ScanFingerprint($opts, 'SHA-256'))" }
-    finally { $session.Dispose() }
-}
+$opts = New-Object WinSCP.SessionOptions -Property @{ Protocol = [WinSCP.Protocol]::Sftp; HostName = 'PRODB2BGW02.jdadelivers.com'; PortNumber = 22 }
+$session = New-Object WinSCP.Session
+$session.ScanFingerprint($opts, 'SHA-256')
+$session.Dispose()
 ```
-Alternatively, with the WinSCP command-line client (prints the fingerprint in
-its output; `-hostkey=*` accepts any key just for the scan):
+
+Aptos (only after the step 2 port test passes):
 ```powershell
-& "C:\Program Files (x86)\WinSCP\WinSCP.com" /command `
-  "open sftp://PRODB2BGW02.jdadelivers.com/ -hostkey=*" "exit"
-& "C:\Program Files (x86)\WinSCP\WinSCP.com" /command `
-  "open sftp://10.252.16.100/ -hostkey=*" "exit"
+$opts = New-Object WinSCP.SessionOptions -Property @{ Protocol = [WinSCP.Protocol]::Sftp; HostName = '10.252.16.100'; PortNumber = 22 }
+$session = New-Object WinSCP.Session
+$session.ScanFingerprint($opts, 'SHA-256')
+$session.Dispose()
 ```
+
+If you prefer a single pasteable line, separate statements with `;`:
+```powershell
+Add-Type -Path "C:\Program Files (x86)\WinSCP\WinSCPnet.dll"; $opts = New-Object WinSCP.SessionOptions -Property @{ Protocol=[WinSCP.Protocol]::Sftp; HostName='PRODB2BGW02.jdadelivers.com'; PortNumber=22 }; $session = New-Object WinSCP.Session; $session.ScanFingerprint($opts,'SHA-256'); $session.Dispose()
+```
+
+Or capture it from the WinSCP GUI: connect to the host, and on the
+"unknown server" dialog click **Copy key fingerprints to clipboard**
+(or afterwards via **Session > Server/Protocol Information**).
+
 Put each returned fingerprint into the matching `SshHostKey` field in
 `Sync-BlueYonder-Aptos.ps1`. This pins the server identity and prevents
 man-in-the-middle connections.
