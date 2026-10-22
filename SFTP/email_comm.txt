@@ -1,0 +1,27 @@
+Subject: Clarification needed — file archiving requirements for Blue Yonder ↔ Aptos SFTP transfer
+
+Hi [Application Team contact name],
+
+We're finalizing the new SFTP transfer job between Blue Yonder and Aptos (the replacement for the legacy DataExchange/JDA job), running via the vwpsftp01 staging server.
+
+The job currently copies files between the two servers, and we understand that instead of deleting the source files after transfer, the requirement is to archive them (specifically the .go and .xml files). Before we implement this, we'd like to confirm a few details so the behavior matches your expectations:
+
+Scope of archiving — Should we archive:
+
+only the destination files (after they've been copied), or
+both source and destination files?
+Archive locations — For whichever files need archiving, please provide the absolute archive paths on each server:
+
+Blue Yonder (PRODB2BGW02.jdadelivers.com): archive path for _______
+Aptos (10.252.16.100): archive path for _______
+Any additional preferences (optional but helpful):
+
+Should archived files keep their original names, or be timestamped to avoid collisions?
+Is there a retention period after which archived files can be purged?
+For reference, the current transfer paths are:
+
+Invoices: Blue Yonder /home/eurorpatprdv2/outbox (STSIMATIN*.go) → Aptos /Transfer/IN/Merch/Invoices/Company1
+Purchase Orders: Aptos /Transfer/Out/Merch/PurchaseOrder → Blue Yonder /home/eurorpatprdv2/inbox
+Once we have these details, we'll update the transfer job accordingly and proceed with testing.
+
+Thanks very much
