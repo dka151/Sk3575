@@ -6,7 +6,7 @@
 .DESCRIPTION
     Creates a daily (and optionally repeating) scheduled task. The task runs
     PowerShell non-interactively, executing the transfer script with the
-    production flags (both flows, move mode).
+    production flags (both flows, copy + archive source).
 
     Run this ON vwpsftp01, as an administrator. You will be prompted for the
     service account password (used by Task Scheduler to launch the task).
@@ -47,15 +47,15 @@ if (-not (Test-Path $ScriptPath)) {
     throw "Script not found: $ScriptPath. Copy it to vwpsftp01 first."
 }
 
-# Production arguments: run both flows, move files (delete source after verified upload).
-# Remove -DeleteSourceAfter if you want copy-only behaviour.
+# Production arguments: run both flows with copy + archive-source behaviour.
+# ArchiveSource defaults to $true in the script, so no extra flag is needed.
+# For copy-only (no archive), append: '-ArchiveSource:$false'
 $scriptArgs = @(
     '-NoProfile'
     '-NonInteractive'
     '-ExecutionPolicy', 'Bypass'
     '-File', "`"$ScriptPath`""
     '-Mode', 'Both'
-    '-DeleteSourceAfter'
 ) -join ' '
 
 $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $scriptArgs -WorkingDirectory (Split-Path $ScriptPath)

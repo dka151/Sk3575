@@ -14,8 +14,9 @@
 .DESCRIPTION
     SFTP cannot stream directly between two remote servers, so vwpsftp01 is the
     broker: each file is downloaded from the source into a local staging folder,
-    uploaded to the destination, verified, and (optionally) removed from the
-    source after a verified upload. The staging copy is always cleaned up.
+    uploaded to the destination, verified, and then ARCHIVED on the source server
+    (moved into the source's archive folder) rather than deleted. The local
+    staging copy is always cleaned up.
 
     Authentication is username + password for both servers, read from
     DPAPI-encrypted credential files (Export-Clixml) so the script runs unattended
@@ -32,18 +33,26 @@
 .PARAMETER Mode
     Which flow(s) to run: Both (default), InvoicesOnly, or PosOnly.
 
-.PARAMETER DeleteSourceAfter
-    Delete each source file after a verified upload (a MOVE, matching the original
-    job's behaviour of consuming files from the outbox/outbound folders). Off by
-    default so your first runs are non-destructive copies.
+.PARAMETER ArchiveSource
+    After a verified upload, archive each source file by moving it into the source
+    server's ArchivePath (see config), instead of leaving it in the source folder.
+    Defaults to $true (required production behaviour). Pass -ArchiveSource:$false
+    for a pure non-destructive copy during early testing.
+
+.PARAMETER ArchiveDestination
+    Also place an archive COPY of each file in the destination server's
+    DestArchivePath (see config). The delivered file stays in the destination
+    folder for the receiving application; this just adds a second copy under the
+    archive folder. OFF by default; enable only if the application team confirms
+    destination archiving is required.
 
 .PARAMETER WhatIf
     Dry run: logs what each flow WOULD transfer without moving anything.
 
 .EXAMPLE
-    .\Sync-BlueYonder-Aptos.ps1 -WhatIf                 # safe first run
-    .\Sync-BlueYonder-Aptos.ps1                         # both flows, copy
-    .\Sync-BlueYonder-Aptos.ps1 -DeleteSourceAfter      # both flows, move (production)
+    .\Sync-BlueYonder-Aptos.ps1 -WhatIf                     # safe first run, nothing moves
+    .\Sync-BlueYonder-Aptos.ps1 -ArchiveSource:$false       # both flows, copy only (no archive)
+    .\Sync-BlueYonder-Aptos.ps1                             # both flows, copy + archive source (production)
 
 .NOTES
     Requires WinSCP installed on vwpsftp01 (WinSCPnet.dll). Adjust $WinScpDllPath
@@ -60,7 +69,17 @@ param(
     [string]$LogPath          = 'C:\sftp\logs\blueyonder-aptos.log',
     [string]$WinScpLogPath    = 'C:\sftp\logs\winscp-session.log',
 
-    [switch]$DeleteSourceAfter
+    # After a verified upload, archive each source file into the source server's
+    # ArchivePath (a MOVE within the source server) instead of leaving it in place.
+    # On by default: this is the required production behaviour. Use -ArchiveSource:$false
+    # for a pure non-destructive copy during early testing.
+    [bool]$ArchiveSource = $true,
+
+    # Also keep an archive copy of each file on the DESTINATION server, placed in
+    # the destination's ArchivePath. This is a COPY (the delivered file stays in
+    # the destination folder for the receiving application). OFF by default; enable
+    # only if the application team confirms destination archiving is required.
+    [switch]$ArchiveDestination
 )
 
 $ErrorActionPreference = 'Stop'
@@ -81,8 +100,14 @@ $BlueYonder = @{
     PortNumber     = 22
     CredFile       = Join-Path $CredentialFolder 'blueyonder.cred.xml'
     SshHostKey     = 'TODO-PASTE-BLUEYONDER-HOSTKEY-FINGERPRINT'   # scan with WinSCP ScanFingerprint (see header) for PRODB2BGW02.jdadelivers.com
-    OutboxPath     = '/home/europatprdv2/outbox'   # invoices come FROM here
-    InboxPath      = '/home/europatprdv2/inbox'    # POs go TO here
+    OutboxPath     = '/home/eurorpatprdv2/outbox'   # invoices come FROM here (absolute, uses login-user home)
+    InboxPath      = '/home/eurorpatprdv2/inbox'    # POs go TO here (absolute, uses login-user home)
+    # Archive folder on Blue Yonder for SOURCE files picked up from OutboxPath.
+    # TODO: confirm the exact absolute archive path with the application team.
+    ArchivePath    = '/home/eurorpatprdv2/outbox/archive'
+    # Archive folder on Blue Yonder for DESTINATION files delivered to InboxPath
+    # (only used when -ArchiveDestination is supplied). TODO: confirm with app team.
+    DestArchivePath = '/home/eurorpatprdv2/inbox/archive'
 }
 
 # --- Aptos SFTP endpoint ---
@@ -93,6 +118,12 @@ $Aptos = @{
     SshHostKey      = 'TODO-PASTE-APTOS-HOSTKEY-FINGERPRINT'       # scan with WinSCP ScanFingerprint (see header) for 10.252.16.100
     InvoicesInPath  = '/Transfer/IN/Merch/Invoices/Company1'      # invoices go TO here
     PurchaseOutPath = '/Transfer/Out/Merch/PurchaseOrder'         # POs come FROM here
+    # Archive folder on Aptos for SOURCE files picked up from PurchaseOutPath.
+    # TODO: confirm the exact absolute archive path with the application team.
+    ArchivePath     = '/Transfer/Out/Merch/PurchaseOrder/archive'
+    # Archive folder on Aptos for DESTINATION files delivered to InvoicesInPath
+    # (only used when -ArchiveDestination is supplied). TODO: confirm with app team.
+    DestArchivePath = '/Transfer/IN/Merch/Invoices/Company1/archive'
 }
 
 # File patterns per flow (from the legacy job):
@@ -157,10 +188,28 @@ function Invoke-TransferFlow {
         [string]$Name,
         [WinSCP.Session]$SourceSession, [string]$SourceDir,
         [WinSCP.Session]$DestSession,   [string]$DestDir,
-        [string]$Pattern
+        [string]$Pattern,
+        [string]$ArchiveDir,      # folder on the SOURCE server to move files into after a verified upload
+        [string]$DestArchiveDir   # folder on the DESTINATION server to copy delivered files into (optional)
     )
 
     Write-Log "=== FLOW: $Name ==="
+
+    # Ensure the source-server archive folder exists (idempotent).
+    if ($ArchiveSource -and $ArchiveDir) {
+        if (-not $SourceSession.FileExists($ArchiveDir)) {
+            Write-Log "Creating archive folder on source: $ArchiveDir"
+            $SourceSession.CreateDirectory($ArchiveDir)
+        }
+    }
+
+    # Ensure the destination-server archive folder exists (idempotent), only when enabled.
+    if ($ArchiveDestination -and $DestArchiveDir) {
+        if (-not $DestSession.FileExists($DestArchiveDir)) {
+            Write-Log "Creating archive folder on destination: $DestArchiveDir"
+            $DestSession.CreateDirectory($DestArchiveDir)
+        }
+    }
 
     $remoteItems = $SourceSession.ListDirectory($SourceDir).Files |
         Where-Object { -not $_.IsDirectory -and $_.Name -like $Pattern }
@@ -180,6 +229,8 @@ function Invoke-TransferFlow {
         $remoteSrcPath = ($SourceDir.TrimEnd('/')) + '/' + $name
         $localPath     = Join-Path $StagingPath $name
         $remoteDstPath = ($DestDir.TrimEnd('/')) + '/' + $name
+        $remoteArchivePath = if ($ArchiveDir) { ($ArchiveDir.TrimEnd('/')) + '/' + $name } else { $null }
+        $remoteDestArchivePath = if ($DestArchiveDir) { ($DestArchiveDir.TrimEnd('/')) + '/' + $name } else { $null }
 
         if (-not $PSCmdlet.ShouldProcess($name, "Transfer ($Name)")) {
             Write-Log "[WhatIf] Would transfer $remoteSrcPath -> $remoteDstPath"
@@ -207,10 +258,33 @@ function Invoke-TransferFlow {
             }
             Write-Log "Verified on destination: $remoteDstPath"
 
-            # 4. Optional: delete source after verified upload
-            if ($DeleteSourceAfter) {
-                Write-Log "Deleting source $remoteSrcPath"
-                $SourceSession.RemoveFiles($remoteSrcPath).Check()
+            # 4. Archive the source file (move within the source server) after a
+            #    verified upload. This replaces deletion: the original is preserved
+            #    under the source server's archive folder.
+            if ($ArchiveSource -and $remoteArchivePath) {
+                Write-Log "Archiving source $remoteSrcPath -> $remoteArchivePath"
+                # MoveFile(sourcePath, targetPath). WinSCP overwrites if the target
+                # already exists; the target name matches the original file name.
+                $SourceSession.MoveFile($remoteSrcPath, $remoteArchivePath)
+                if (-not $SourceSession.FileExists($remoteArchivePath)) {
+                    Write-Log "Archive verification failed: $remoteArchivePath not found after move." 'ERROR'
+                    continue
+                }
+                Write-Log "Archived on source: $remoteArchivePath"
+            }
+
+            # 4b. Optionally keep an archive COPY on the destination server. The
+            #     delivered file in $DestDir is left in place for the receiving
+            #     application; a second copy is placed in the destination archive
+            #     folder. Re-uploads the already-verified local staging copy.
+            if ($ArchiveDestination -and $remoteDestArchivePath) {
+                Write-Log "Archiving on destination (copy) $localPath -> $remoteDestArchivePath"
+                $DestSession.PutFiles($localPath, $remoteDestArchivePath, $false, $transferOpts).Check()
+                if (-not $DestSession.FileExists($remoteDestArchivePath)) {
+                    Write-Log "Destination archive verification failed: $remoteDestArchivePath not found." 'ERROR'
+                    continue
+                }
+                Write-Log "Archived on destination: $remoteDestArchivePath"
             }
 
             $count++
@@ -249,23 +323,30 @@ try {
         Invoke-TransferFlow -Name 'INVOICES Blue Yonder -> Aptos' `
             -SourceSession $byeSession   -SourceDir $BlueYonder.OutboxPath `
             -DestSession   $aptosSession -DestDir   $Aptos.InvoicesInPath `
-            -Pattern $InvoicePattern
+            -Pattern $InvoicePattern `
+            -ArchiveDir $BlueYonder.ArchivePath `
+            -DestArchiveDir $Aptos.DestArchivePath
     }
 
     if ($Mode -in @('Both', 'PosOnly')) {
         Invoke-TransferFlow -Name 'PURCHASE ORDERS Aptos -> Blue Yonder' `
             -SourceSession $aptosSession -SourceDir $Aptos.PurchaseOutPath `
             -DestSession   $byeSession   -DestDir   $BlueYonder.InboxPath `
-            -Pattern $PoPattern
+            -Pattern $PoPattern `
+            -ArchiveDir $Aptos.ArchivePath `
+            -DestArchiveDir $BlueYonder.DestArchivePath
     }
 
     Write-Log "All requested flows completed."
 }
 catch {
     Write-Log "Run failed: $($_.Exception.Message)" 'ERROR'
-    throw
+    # Exit with a non-zero code so SQL Agent (CmdExec) marks the job step as FAILED.
+    exit 1
 }
 finally {
     if ($byeSession)   { $byeSession.Dispose();   Write-Log "Closed Blue Yonder session." }
     if ($aptosSession) { $aptosSession.Dispose(); Write-Log "Closed Aptos session." }
 }
+
+exit 0
