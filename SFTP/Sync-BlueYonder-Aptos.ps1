@@ -108,17 +108,17 @@ $Aptos = @{
     PortNumber      = 22
     CredFile        = Join-Path $CredentialFolder 'aptos.cred.xml'
     SshHostKey      = 'TODO-PASTE-APTOS-HOSTKEY-FINGERPRINT'       # scan with WinSCP ScanFingerprint (see header) for 10.252.16.100
-    InvoicesInPath  = '/Transfer/IN/Merch/Invoices/Company1'      # invoices (STSIMATIN*.go) go TO here
-    AsnInPath       = '/Transfer/IN/Merch/EDI ASN'               # ASNs (STSIMASN*.go) go TO here (note the space)
-    PurchaseOutPath = '/Transfer/Out/Merch/PurchaseOrder'         # POs come FROM here
+    InvoicesInPath  = '/IN/Merch/Invoices/Company1'      # invoices (STSIMATIN*.go) go TO here
+    AsnInPath       = '/IN/Merch/EDI ASN'               # ASNs (STSIMASN*.go) go TO here (note the space)
+    PurchaseOutPath = '/Out/Merch/PurchaseOrder'         # POs come FROM here
 }
 
 # Blue Yonder outbox -> Aptos routing. Each entry maps a filename pattern in the
 # Blue Yonder outbox to its Aptos destination folder. Add more rows here to route
 # additional document types from the same outbox.
 $OutboundRoutes = @(
-    @{ Label = 'INVOICES'; Pattern = 'STSIMATIN*.go'; DestPath = $Aptos.InvoicesInPath }
-    @{ Label = 'ASN';      Pattern = 'STSIMASN*.go';  DestPath = $Aptos.AsnInPath }
+    @{ Label = 'INVOICES'; Tag = 'ATIN'; Pattern = 'STSIMATIN*.go'; DestPath = $Aptos.InvoicesInPath }
+    @{ Label = 'ASN';      Tag = 'ASN';  Pattern = 'STSIMASN*.go';  DestPath = $Aptos.AsnInPath }
 )
 
 # Aptos -> Blue Yonder purchase orders.
@@ -128,10 +128,18 @@ $PoPattern = '*'   # purchase orders from Aptos
 # IMPLEMENTATION  --  no edits needed below
 # ===========================================================================
 
+# Current flow tag (e.g. INVOICES / ASN / EXPORTPO) used in the log prefix, and
+# the OS process id, to mirror the legacy FD/FILEMOVER log format:
+#   HH:mm:ss:fff  <TAG>  (<pid>) : <message>
+$script:FlowTag = 'STARTUP'
+$script:ProcId  = $PID
+
 function Write-Log {
     param([string]$Message, [string]$Level = 'INFO')
-    $ts   = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $line = "[$ts] [$Level] $Message"
+    $ts   = Get-Date -Format 'HH:mm:ss:fff'
+    $tag  = $script:FlowTag.PadRight(10)
+    $line = "{0} {1} ({2}) : {3}" -f $ts, $tag, $script:ProcId, $Message
+    if ($Level -eq 'ERROR') { $line = "{0} {1} ({2}) : ERROR: {3}" -f $ts, $tag, $script:ProcId, $Message }
     Write-Host $line
     try { Add-Content -Path $LogPath -Value $line -ErrorAction Stop } catch { }
 }
@@ -170,28 +178,58 @@ function New-WinScpSession {
     }
 
     $session = New-Object WinSCP.Session
-    if ($WinScpLogPath) { $session.SessionLogPath = $WinScpLogPath }
-    Write-Log "Connecting to $Role $($Endpoint.HostName):$($Endpoint.PortNumber) as $($cred.UserName) ..."
+    # Each endpoint gets its OWN session log file so one session never appends to
+    # another's log. Files are already deleted in preflight, so each is written
+    # fresh, once, per run.
+    if ($WinScpLogPath) {
+        $session.SessionLogPath = Get-EndpointWinScpLogPath -Role $Role
+    }
+    Write-Log "openConnection(): connecting to $Role $($Endpoint.HostName):$($Endpoint.PortNumber) as $($cred.UserName) ..."
     $session.Open($opts)
-    Write-Log "$Role session opened."
+    Write-Log "openConnection(): Connection establish to $($Endpoint.HostName)."
     return $session
+}
+
+function Get-EndpointWinScpLogPath {
+    # Builds a per-endpoint WinSCP session log path from $WinScpLogPath, e.g.
+    #   C:\sftp\logs\winscp-session.log -> C:\sftp\logs\winscp-session.BlueYonder.log
+    param([string]$Role)
+    $dir  = Split-Path -Parent $WinScpLogPath
+    $base = [System.IO.Path]::GetFileNameWithoutExtension($WinScpLogPath)
+    $ext  = [System.IO.Path]::GetExtension($WinScpLogPath)
+    $safeRole = ($Role -replace '\s', '')   # "Blue Yonder" -> "BlueYonder"
+    return (Join-Path $dir ("{0}.{1}{2}" -f $base, $safeRole, $ext))
 }
 
 function Invoke-TransferFlow {
     param(
         [string]$Name,
+        [string]$Tag,             # short label for the log prefix (INVOICES / ASN / EXPORTPO)
         [WinSCP.Session]$SourceSession, [string]$SourceDir,
         [WinSCP.Session]$DestSession,   [string]$DestDir,
         [string]$Pattern
     )
 
-    Write-Log "=== FLOW: $Name ==="
+    $script:FlowTag = $Tag
+    Write-Log "Entering process."
+    Write-Log "Flow: $Name"
 
-    $remoteItems = $SourceSession.ListDirectory($SourceDir).Files |
-        Where-Object { -not $_.IsDirectory -and $_.Name -like $Pattern }
+    $remoteMask = ($SourceDir.TrimEnd('/')) + '/' + $Pattern
+    Write-Log "Using remote mask '$remoteMask'."
+
+    # List the source directory. A failure here (e.g. source folder missing or
+    # inaccessible) is logged and ends the flow cleanly rather than aborting the run.
+    try {
+        $remoteItems = $SourceSession.ListDirectory($SourceDir).Files |
+            Where-Object { -not $_.IsDirectory -and $_.Name -like $Pattern }
+    }
+    catch {
+        Write-Log "listDirectory(): FAILED to list '$SourceDir': $($_.Exception.Message)" 'ERROR'
+        return
+    }
 
     if (-not $remoteItems) {
-        Write-Log "No files matching '$Pattern' in $SourceDir. Nothing to transfer." 'WARN'
+        Write-Log "No files matching '$Pattern' in $SourceDir. Nothing to transfer."
         return
     }
     Write-Log "Found $($remoteItems.Count) file(s) matching '$Pattern' in $SourceDir."
@@ -223,47 +261,77 @@ function Invoke-TransferFlow {
         $remoteSrcRN    = $remoteSrcPath + '.RN'    # claimed/renamed source on the source server
         $remoteDstTmp   = $remoteDstPath + '.TMP'   # in-progress upload name on the destination
 
+        $srcHost = $SourceSession.SessionOptions.HostName
+        $dstHost = $DestSession.SessionOptions.HostName
+
         try {
-            # 1. Download source -> local .TMP (partial downloads are not mistaken
-            #    for complete files).
-            Write-Log "getFile(): $remoteSrcPath -> $localTmp"
-            $SourceSession.GetFiles($remoteSrcPath, $localTmp, $false, $transferOpts).Check()
+            # 1. Download source -> local .TMP.
+            try {
+                $SourceSession.GetFiles($remoteSrcPath, $localTmp, $false, $transferOpts).Check()
+                Write-Log "getFile(): Successfully received file from $remoteSrcPath to $localTmp on machine $srcHost"
+            }
+            catch {
+                Write-Log "getFile(): FAILED to receive $remoteSrcPath from machine ${srcHost}: $($_.Exception.Message)" 'ERROR'
+                continue
+            }
 
             if (-not (Test-Path $localTmp)) {
-                Write-Log "Download produced no local file: $localTmp" 'ERROR'
+                Write-Log "getFile(): download produced no local file: $localTmp" 'ERROR'
                 continue
             }
 
             # 2. Claim the source by renaming it to .RN on the source server.
-            Write-Log "renameRemoteFile(): $remoteSrcPath -> $remoteSrcRN"
-            $SourceSession.MoveFile($remoteSrcPath, $remoteSrcRN)
+            try {
+                $SourceSession.MoveFile($remoteSrcPath, $remoteSrcRN)
+                Write-Log "renameRemoteFile(): Successfully renamed $remoteSrcPath to $remoteSrcRN"
+            }
+            catch {
+                Write-Log "renameRemoteFile(): FAILED to rename source $remoteSrcPath to $remoteSrcRN on machine ${srcHost}: $($_.Exception.Message)" 'ERROR'
+                continue
+            }
 
             # 3. Rename local .TMP to its final name (download now complete).
             if (Test-Path $localPath) { Remove-Item $localPath -Force -ErrorAction SilentlyContinue }
             Rename-Item -Path $localTmp -NewName $name
-            Write-Log "Renamed local $localTmp -> $localPath"
+            Write-Log "Successfully renamed local file from $localTmp to $localPath"
 
             # 4. Upload local file to a remote .TMP name on the destination.
-            Write-Log "sendFile(): $localPath -> $remoteDstTmp"
-            $DestSession.PutFiles($localPath, $remoteDstTmp, $false, $transferOpts).Check()
-
-            # 5. Rename remote .TMP to the final name so the receiving app only
-            #    ever sees a complete file (atomic reveal).
-            Write-Log "renameRemoteFile(): $remoteDstTmp -> $remoteDstPath"
-            $DestSession.MoveFile($remoteDstTmp, $remoteDstPath)
-
-            if (-not $DestSession.FileExists($remoteDstPath)) {
-                Write-Log "Delivery verification failed: $remoteDstPath not found on destination." 'ERROR'
+            try {
+                $DestSession.PutFiles($localPath, $remoteDstTmp, $false, $transferOpts).Check()
+                Write-Log "sendFile(): Successfully sent file from $localPath to $remoteDstTmp on machine $dstHost"
+            }
+            catch {
+                Write-Log "sendFile(): FAILED to send $localPath to $remoteDstTmp on machine ${dstHost}: $($_.Exception.Message)" 'ERROR'
+                Write-Log "sendFile(): check that the destination folder '$DestDir' exists on $dstHost and the login has write access." 'ERROR'
                 continue
             }
-            Write-Log "Delivered to destination: $remoteDstPath"
+
+            # 5. Rename remote .TMP to the final name (atomic reveal).
+            try {
+                $DestSession.MoveFile($remoteDstTmp, $remoteDstPath)
+                Write-Log "renameRemoteFile(): Successfully renamed $remoteDstTmp to $remoteDstPath on machine $dstHost"
+            }
+            catch {
+                Write-Log "renameRemoteFile(): FAILED to rename $remoteDstTmp to $remoteDstPath on machine ${dstHost}: $($_.Exception.Message)" 'ERROR'
+                continue
+            }
+
+            if (-not $DestSession.FileExists($remoteDstPath)) {
+                Write-Log "Delivery verification FAILED: $remoteDstPath not found on destination $dstHost." 'ERROR'
+                continue
+            }
+            Write-Log "Delivered to destination: $remoteDstPath on machine $dstHost"
 
             # 6. Remove the claimed source file (.RN) from the source server.
-            #    Gated behind -DeleteSourceAfter as a safety measure: without it,
-            #    the claimed .RN file is left in place and nothing is deleted.
+            #    Gated behind -DeleteSourceAfter as a safety measure.
             if ($DeleteSourceAfter) {
-                Write-Log "removeRemoteFile(): $remoteSrcRN"
-                $SourceSession.RemoveFiles($remoteSrcRN).Check()
+                try {
+                    $SourceSession.RemoveFiles($remoteSrcRN).Check()
+                    Write-Log "removeRemoteFile(): Successfully deleted file $remoteSrcRN"
+                }
+                catch {
+                    Write-Log "removeRemoteFile(): FAILED to delete $remoteSrcRN on machine ${srcHost}: $($_.Exception.Message)" 'ERROR'
+                }
             }
             else {
                 Write-Log "DeleteSourceAfter not set; leaving claimed source in place: $remoteSrcRN"
@@ -272,7 +340,7 @@ function Invoke-TransferFlow {
             $count++
         }
         catch {
-            Write-Log "Error transferring '$name': $($_.Exception.Message)" 'ERROR'
+            Write-Log "Unexpected error transferring '$name': $($_.Exception.Message)" 'ERROR'
         }
         finally {
             # Always clean up any local staging copies (.TMP and final).
@@ -281,12 +349,22 @@ function Invoke-TransferFlow {
         }
     }
 
-    Write-Log "FLOW '$Name' complete: $count of $($remoteItems.Count) file(s) transferred."
+    Write-Log "$count of $($remoteItems.Count) file(s) transferred."
+    Write-Log "Exiting process."
 }
 
 # --- Preflight -------------------------------------------------------------
 foreach ($dir in @($StagingPath, (Split-Path $LogPath), (Split-Path $WinScpLogPath))) {
     if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+}
+
+# Start each run with FRESH log files -- remove any previous run's logs so this
+# run never amends an older file. This covers the script log plus the base
+# WinSCP session log and the per-endpoint session logs (winscp-session.*.log).
+$logsToReset = @($LogPath, $WinScpLogPath)
+$logsToReset += @('Blue Yonder', 'Aptos') | ForEach-Object { Get-EndpointWinScpLogPath -Role $_ }
+foreach ($log in ($logsToReset | Select-Object -Unique)) {
+    if ($log -and (Test-Path $log)) { Remove-Item $log -Force -ErrorAction SilentlyContinue }
 }
 
 if (-not (Test-Path $WinScpDllPath)) {
@@ -306,7 +384,7 @@ try {
         # One flow per routing rule: same Blue Yonder outbox, different Aptos
         # destination per filename pattern (invoices, ASN, ...).
         foreach ($route in $OutboundRoutes) {
-            Invoke-TransferFlow -Name "$($route.Label) Blue Yonder -> Aptos" `
+            Invoke-TransferFlow -Name "$($route.Label) Blue Yonder -> Aptos" -Tag $route.Tag `
                 -SourceSession $byeSession   -SourceDir $BlueYonder.OutboxPath `
                 -DestSession   $aptosSession -DestDir   $route.DestPath `
                 -Pattern $route.Pattern
@@ -314,7 +392,7 @@ try {
     }
 
     if ($Mode -in @('Both', 'PosOnly')) {
-        Invoke-TransferFlow -Name 'PURCHASE ORDERS Aptos -> Blue Yonder' `
+        Invoke-TransferFlow -Name 'PURCHASE ORDERS Aptos -> Blue Yonder' -Tag 'EXPORTPO' `
             -SourceSession $aptosSession -SourceDir $Aptos.PurchaseOutPath `
             -DestSession   $byeSession   -DestDir   $BlueYonder.InboxPath `
             -Pattern $PoPattern
