@@ -8,35 +8,37 @@ WinSCP installed and network access to both endpoints).
 Blue Yonder SFTP  <-->  vwpsftp01 (staging, WinSCP)  <-->  Aptos SFTP
 ```
 
-SFTP cannot stream directly between two remote servers, so vwpsftp01 downloads
-each file to a local staging folder, uploads it to the other server, verifies
-it, and then (in production) **archives** the source copy by moving it into an
-archive folder on the same source server — the source file is preserved, not
-deleted.
+SFTP cannot stream directly between two remote servers, so vwpsftp01 is the
+broker. Each file follows the legacy DataExchange/JDA transfer pattern:
+download to a local `.TMP`, rename the remote source to `.RN` (claim it), rename
+the local `.TMP` to its final name, upload to a remote `.TMP` on the destination,
+then rename that remote `.TMP` to the final name (atomic reveal — the receiving
+app never sees a partial file). In production the claimed source (`.RN`) is then
+deleted, making it a MOVE.
 
 ## Flows
 
-| Flow | Source | Pattern | Destination | Source archive |
-|------|--------|---------|-------------|----------------|
-| Invoices | Blue Yonder `PRODB2BGW02.jdadelivers.com:/home/eurorpatprdv2/outbox` | `STSIMATIN*.go` | Aptos `10.252.16.100:/Transfer/IN/Merch/Invoices/Company1` | `/home/eurorpatprdv2/outbox/archive` (TODO: confirm) |
-| Purchase Orders | Aptos `10.252.16.100:/Transfer/Out/Merch/PurchaseOrder` | `*` | Blue Yonder `PRODB2BGW02.jdadelivers.com:/home/eurorpatprdv2/inbox` | `/Transfer/Out/Merch/PurchaseOrder/archive` (TODO: confirm) |
+| Flow | Source | Pattern | Destination |
+|------|--------|---------|-------------|
+| Invoices | Blue Yonder `PRODB2BGW02.jdadelivers.com:/home/eurorpatprdv2/outbox` | `STSIMATIN*.go` | Aptos `10.252.16.100:/Transfer/IN/Merch/Invoices/Company1` |
+| ASN | Blue Yonder `PRODB2BGW02.jdadelivers.com:/home/eurorpatprdv2/outbox` | `STSIMASN*.go` | Aptos `10.252.16.100:/Transfer/IN/Merch/EDI ASN` |
+| Purchase Orders | Aptos `10.252.16.100:/Transfer/Out/Merch/PurchaseOrder` | `*` | Blue Yonder `PRODB2BGW02.jdadelivers.com:/home/eurorpatprdv2/inbox` |
 
-After a verified upload, each source file is moved into its "Source archive"
-folder on the same server. Archive paths are placeholders in the script
-(`ArchivePath` / `DestArchivePath` under each endpoint) pending confirmation from
-the application team.
+Invoices and ASN share the same Blue Yonder outbox and are routed to different
+Aptos folders by filename pattern. The routing is table-driven in the script
+(`$OutboundRoutes`) — add a row there to route another document type from the
+same outbox. (Note: the ASN destination folder name contains a space: `EDI ASN`.)
 
-**Destination archiving (optional, OFF by default).** Passing `-ArchiveDestination`
-also places a *copy* of each delivered file into the destination server's
-`DestArchivePath` — the delivered file stays in its normal folder for the
-receiving app, and a second copy lands in the archive folder. Defaults:
+**Transfer pattern (per file, matching the legacy job logs):**
+1. `getFile()` — download source to a local `.TMP`
+2. `renameRemoteFile()` — rename remote source to `.RN` (claim it)
+3. rename local `.TMP` to its final name
+4. `sendFile()` — upload to a remote `.TMP` on the destination
+5. `renameRemoteFile()` — rename remote `.TMP` to the final name (atomic reveal)
+6. `removeRemoteFile()` — delete the claimed source `.RN` **(only when `-DeleteSourceAfter` is passed)**
 
-| Destination | DestArchivePath (TODO: confirm) |
-|-------------|---------------------------------|
-| Aptos `/Transfer/IN/Merch/Invoices/Company1` | `/Transfer/IN/Merch/Invoices/Company1/archive` |
-| Blue Yonder `/home/eurorpatprdv2/inbox` | `/home/eurorpatprdv2/inbox/archive` |
-
-Source archiving MOVES the file; destination archiving COPIES it.
+`-DeleteSourceAfter` is a safety switch: with it, step 6 runs (true MOVE);
+without it, delivery still completes but the claimed `.RN` is left on the source.
 
 ## Endpoints
 
@@ -142,16 +144,15 @@ Lock down `C:\sftp\creds` so only the service account and admins can read it.
 Run as the service account (`WSS\vwpsftp01sql`):
 ```powershell
 cd C:\sftp
-.\Sync-BlueYonder-Aptos.ps1 -WhatIf                        # lists what WOULD transfer, moves nothing
-.\Sync-BlueYonder-Aptos.ps1 -ArchiveSource:$false          # real run, COPY only (source left in place)
-.\Sync-BlueYonder-Aptos.ps1                                # real run, COPY + ARCHIVE source (production default)
-.\Sync-BlueYonder-Aptos.ps1 -ArchiveDestination            # also keep a COPY in the destination archive folder
+.\Sync-BlueYonder-Aptos.ps1 -WhatIf              # lists what WOULD transfer, moves nothing
+.\Sync-BlueYonder-Aptos.ps1                      # deliver; leave claimed source (.RN) in place (safety mode)
+.\Sync-BlueYonder-Aptos.ps1 -DeleteSourceAfter   # full MOVE: delete claimed source after verified delivery
 ```
 Check `C:\sftp\logs\blueyonder-aptos.log` and confirm files landed on both sides.
-Run the default (copy + archive) only once you are satisfied the copy-only runs
-land correctly. Source archiving MOVES the source file into the source server's
-archive folder; `-ArchiveDestination` additionally COPIES the delivered file into
-the destination server's archive folder (off unless the app team requires it).
+Run `-DeleteSourceAfter` (the production behaviour) only once you are satisfied
+delivery is working. Note: every run claims the source by renaming it to `.RN`;
+without `-DeleteSourceAfter` those `.RN` files stay on the source until a run
+with the switch cleans them up.
 
 ### 6. Schedule it — SQL Agent job (chosen method)
 The SQL Server Agent service runs as `WSS\vwpsftp01sql` — the same account that
@@ -171,12 +172,14 @@ What the script sets up:
   account `WSS\vwpsftp01sql`. No proxy/SQL credential needed. (If the job must be
   owned by a non-sysadmin, create a CmdExec proxy bound to a `WSS\vwpsftp01sql`
   credential instead.)
-- Production behaviour: both flows, copy + archive source.
+- Production behaviour: both flows, legacy `.TMP`/`.RN` pattern, `-DeleteSourceAfter`
+  passed (true MOVE — claimed source deleted after a verified delivery).
 - `exit $LASTEXITCODE` plus the script's `exit 1` on failure make SQL Agent mark
   the step FAILED when a transfer errors (otherwise it could show success).
 
 To tweak behaviour, edit `Deploy-BlueYonderAptosJob.sql` before running:
-- **Destination archiving:** add `-ArchiveDestination` to the step `@command`.
+- **Test/safety mode:** remove `-DeleteSourceAfter` from the step `@command` to
+  leave claimed `.RN` source files in place (nothing deleted).
 - **Every-30-min schedule:** swap in the alternative `sp_add_schedule` block
   included (commented) at the bottom of the SQL file.
 
@@ -225,14 +228,8 @@ Get-Content C:\sftp\logs\winscp-session.log  -Tail 50
 | No files transferred, "No files matching" | Pattern or folder mismatch. Confirm `STSIMATIN*.go` and the remote paths. |
 
 ## Outstanding items to confirm
-- **Archive paths:** the `ArchivePath` and `DestArchivePath` values in the script
-  are placeholders. Confirm the exact absolute archive paths on each server with
-  the application team, and whether BOTH source and destination files need
-  archiving or just the source. The script archives the SOURCE by default and can
-  also archive the DESTINATION via `-ArchiveDestination` (off by default) — enable
-  it and confirm the `DestArchivePath` values if they require destination copies.
 - **Rotate the Blue Yonder password** after go-live, since it was shared during setup.
 - **Schedule cadence:** confirm desired run time / frequency (default: daily 02:00).
-- **Archiving behaviour:** production default is copy + archive source
-  (`-ArchiveSource` defaults to `$true`). Source files are moved to the archive
-  folder after a verified upload, not deleted.
+- **Transfer behaviour:** production uses the legacy `.TMP`/`.RN` move pattern with
+  `-DeleteSourceAfter` (claimed source deleted after a verified delivery). Omitting
+  the switch is test/safety mode and leaves `.RN` files on the source.

@@ -16,9 +16,13 @@
 
   BEHAVIOUR
     - Runs both flows (invoices + purchase orders).
-    - Production default: copy + archive source (ArchiveSource defaults to $true
-      in the script). To also archive on the destination, append
-      -ArchiveDestination to the @command below.
+    - Uses the legacy DataExchange/JDA transfer pattern: download to local .TMP,
+      rename remote source to .RN (claim), rename local .TMP to final, upload to
+      remote .TMP, rename remote .TMP to final (atomic reveal).
+    - Production: -DeleteSourceAfter is passed so the claimed source (.RN) is
+      deleted after a verified delivery -- a true MOVE, matching the legacy job.
+      Remove -DeleteSourceAfter to leave the claimed source in place (test/safety
+      mode; .RN files will accumulate until a run with the switch cleans them up).
     - 'exit $LASTEXITCODE' + the script's 'exit 1' on failure make the step
       report FAILURE to SQL Agent when a transfer errors.
 
@@ -49,18 +53,19 @@ EXEC msdb.dbo.sp_add_job
     @job_name         = N'BlueYonder-Aptos SFTP Transfer',
     @enabled          = 1,
     @owner_login_name = N'sa',
-    @description      = N'Transfers invoices Blue Yonder->Aptos and purchase orders Aptos->Blue Yonder via vwpsftp01 (WinSCP). Copy + archive source. Replaces legacy DataExchange/JDA job.';
+    @description      = N'Transfers invoices Blue Yonder->Aptos and purchase orders Aptos->Blue Yonder via vwpsftp01 (WinSCP). Legacy .TMP/.RN move pattern; deletes source after verified delivery. Replaces legacy DataExchange/JDA job.';
 GO
 
 /* ---- Job step: run the PowerShell transfer via CmdExec ---- */
-/* NOTE: to also archive delivered files on the destination, add
-         -ArchiveDestination before the '; exit $LASTEXITCODE' part.            */
+/* NOTE: -DeleteSourceAfter makes this a true MOVE (source consumed after a
+         verified delivery). Remove it to run in test/safety mode (claimed .RN
+         source left in place, nothing deleted).                                */
 EXEC msdb.dbo.sp_add_jobstep
     @job_name        = N'BlueYonder-Aptos SFTP Transfer',
     @step_name       = N'Run transfer (both flows)',
     @step_id         = 1,
     @subsystem       = N'CmdExec',
-    @command         = N'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "& ''C:\sftp\Sync-BlueYonder-Aptos.ps1'' -Mode Both; exit $LASTEXITCODE"',
+    @command         = N'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "& ''C:\sftp\Sync-BlueYonder-Aptos.ps1'' -Mode Both -DeleteSourceAfter; exit $LASTEXITCODE"',
     @on_success_action = 1,   -- 1 = Quit the job reporting success
     @on_fail_action    = 2,   -- 2 = Quit the job reporting failure
     @retry_attempts    = 0,

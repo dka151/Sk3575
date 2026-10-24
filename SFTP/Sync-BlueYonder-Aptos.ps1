@@ -5,18 +5,30 @@
 
         Blue Yonder SFTP  <-->  vwpsftp01 (staging)  <-->  Aptos SFTP
 
-    Two flows per run (mirroring the original job):
-      INVOICES-TO-APTOS : Blue Yonder /home/europatprdv2/outbox (STSIMATIN*.go)
+    Flows per run (mirroring the original job):
+      INVOICES -> APTOS : Blue Yonder /home/eurorpatprdv2/outbox (STSIMATIN*.go)
                           -> Aptos /Transfer/IN/Merch/Invoices/Company1
-      POS-TO-BY         : Aptos /Transfer/Out/Merch/PurchaseOrder
-                          -> Blue Yonder /home/europatprdv2/inbox
+      ASN      -> APTOS : Blue Yonder /home/eurorpatprdv2/outbox (STSIMASN*.go)
+                          -> Aptos '/Transfer/IN/Merch/EDI ASN'
+      POS      -> BY    : Aptos /Transfer/Out/Merch/PurchaseOrder
+                          -> Blue Yonder /home/eurorpatprdv2/inbox
+
+    Outbound (Blue Yonder -> Aptos) routing is table-driven via $OutboundRoutes:
+    add a row to route another filename pattern from the same outbox to its own
+    Aptos destination.
 
 .DESCRIPTION
     SFTP cannot stream directly between two remote servers, so vwpsftp01 is the
-    broker: each file is downloaded from the source into a local staging folder,
-    uploaded to the destination, verified, and then ARCHIVED on the source server
-    (moved into the source's archive folder) rather than deleted. The local
-    staging copy is always cleaned up.
+    broker. Each file follows the legacy DataExchange/JDA transfer pattern:
+      PICKUP (source):  download to a local .TMP, rename the remote source to .RN
+                        (claim it), rename the local .TMP to its final name, then
+                        delete the remote .RN.
+      DELIVERY (dest):  upload to a remote .TMP, then rename the remote .TMP to the
+                        final name so the receiving app never sees a partial file.
+    The final delete of the claimed source (.RN) is gated behind -DeleteSourceAfter
+    as a safety measure. With the switch it is a true MOVE (source consumed);
+    without it, delivery still completes but the claimed .RN is left on the source.
+    The local staging copy is always cleaned up.
 
     Authentication is username + password for both servers, read from
     DPAPI-encrypted credential files (Export-Clixml) so the script runs unattended
@@ -33,26 +45,18 @@
 .PARAMETER Mode
     Which flow(s) to run: Both (default), InvoicesOnly, or PosOnly.
 
-.PARAMETER ArchiveSource
-    After a verified upload, archive each source file by moving it into the source
-    server's ArchivePath (see config), instead of leaving it in the source folder.
-    Defaults to $true (required production behaviour). Pass -ArchiveSource:$false
-    for a pure non-destructive copy during early testing.
-
-.PARAMETER ArchiveDestination
-    Also place an archive COPY of each file in the destination server's
-    DestArchivePath (see config). The delivered file stays in the destination
-    folder for the receiving application; this just adds a second copy under the
-    archive folder. OFF by default; enable only if the application team confirms
-    destination archiving is required.
+.PARAMETER DeleteSourceAfter
+    Safety switch. When supplied, the claimed source (.RN) is deleted after a
+    verified delivery (a true MOVE). When omitted (default), delivery completes
+    but the claimed source .RN is left in place -- nothing is deleted.
 
 .PARAMETER WhatIf
     Dry run: logs what each flow WOULD transfer without moving anything.
 
 .EXAMPLE
-    .\Sync-BlueYonder-Aptos.ps1 -WhatIf                     # safe first run, nothing moves
-    .\Sync-BlueYonder-Aptos.ps1 -ArchiveSource:$false       # both flows, copy only (no archive)
-    .\Sync-BlueYonder-Aptos.ps1                             # both flows, copy + archive source (production)
+    .\Sync-BlueYonder-Aptos.ps1 -WhatIf                  # safe first run, nothing moves
+    .\Sync-BlueYonder-Aptos.ps1                          # both flows, deliver; leave claimed source (.RN)
+    .\Sync-BlueYonder-Aptos.ps1 -DeleteSourceAfter       # both flows, MOVE (delete source after verified delivery)
 
 .NOTES
     Requires WinSCP installed on vwpsftp01 (WinSCPnet.dll). Adjust $WinScpDllPath
@@ -69,17 +73,11 @@ param(
     [string]$LogPath          = 'C:\sftp\logs\blueyonder-aptos.log',
     [string]$WinScpLogPath    = 'C:\sftp\logs\winscp-session.log',
 
-    # After a verified upload, archive each source file into the source server's
-    # ArchivePath (a MOVE within the source server) instead of leaving it in place.
-    # On by default: this is the required production behaviour. Use -ArchiveSource:$false
-    # for a pure non-destructive copy during early testing.
-    [bool]$ArchiveSource = $true,
-
-    # Also keep an archive copy of each file on the DESTINATION server, placed in
-    # the destination's ArchivePath. This is a COPY (the delivered file stays in
-    # the destination folder for the receiving application). OFF by default; enable
-    # only if the application team confirms destination archiving is required.
-    [switch]$ArchiveDestination
+    # Safety switch. When supplied, the claimed source file (renamed to .RN during
+    # pickup) is DELETED after a verified delivery -- a true MOVE, matching the
+    # legacy job. When omitted (default), delivery still completes but the claimed
+    # source .RN file is LEFT in place on the source server, so nothing is deleted.
+    [switch]$DeleteSourceAfter
 )
 
 $ErrorActionPreference = 'Stop'
@@ -102,12 +100,6 @@ $BlueYonder = @{
     SshHostKey     = 'TODO-PASTE-BLUEYONDER-HOSTKEY-FINGERPRINT'   # scan with WinSCP ScanFingerprint (see header) for PRODB2BGW02.jdadelivers.com
     OutboxPath     = '/home/eurorpatprdv2/outbox'   # invoices come FROM here (absolute, uses login-user home)
     InboxPath      = '/home/eurorpatprdv2/inbox'    # POs go TO here (absolute, uses login-user home)
-    # Archive folder on Blue Yonder for SOURCE files picked up from OutboxPath.
-    # TODO: confirm the exact absolute archive path with the application team.
-    ArchivePath    = '/home/eurorpatprdv2/outbox/archive'
-    # Archive folder on Blue Yonder for DESTINATION files delivered to InboxPath
-    # (only used when -ArchiveDestination is supplied). TODO: confirm with app team.
-    DestArchivePath = '/home/eurorpatprdv2/inbox/archive'
 }
 
 # --- Aptos SFTP endpoint ---
@@ -116,19 +108,21 @@ $Aptos = @{
     PortNumber      = 22
     CredFile        = Join-Path $CredentialFolder 'aptos.cred.xml'
     SshHostKey      = 'TODO-PASTE-APTOS-HOSTKEY-FINGERPRINT'       # scan with WinSCP ScanFingerprint (see header) for 10.252.16.100
-    InvoicesInPath  = '/Transfer/IN/Merch/Invoices/Company1'      # invoices go TO here
+    InvoicesInPath  = '/Transfer/IN/Merch/Invoices/Company1'      # invoices (STSIMATIN*.go) go TO here
+    AsnInPath       = '/Transfer/IN/Merch/EDI ASN'               # ASNs (STSIMASN*.go) go TO here (note the space)
     PurchaseOutPath = '/Transfer/Out/Merch/PurchaseOrder'         # POs come FROM here
-    # Archive folder on Aptos for SOURCE files picked up from PurchaseOutPath.
-    # TODO: confirm the exact absolute archive path with the application team.
-    ArchivePath     = '/Transfer/Out/Merch/PurchaseOrder/archive'
-    # Archive folder on Aptos for DESTINATION files delivered to InvoicesInPath
-    # (only used when -ArchiveDestination is supplied). TODO: confirm with app team.
-    DestArchivePath = '/Transfer/IN/Merch/Invoices/Company1/archive'
 }
 
-# File patterns per flow (from the legacy job):
-$InvoicePattern = 'STSIMATIN*.go'   # invoices from Blue Yonder outbox
-$PoPattern      = '*'               # purchase orders from Aptos
+# Blue Yonder outbox -> Aptos routing. Each entry maps a filename pattern in the
+# Blue Yonder outbox to its Aptos destination folder. Add more rows here to route
+# additional document types from the same outbox.
+$OutboundRoutes = @(
+    @{ Label = 'INVOICES'; Pattern = 'STSIMATIN*.go'; DestPath = $Aptos.InvoicesInPath }
+    @{ Label = 'ASN';      Pattern = 'STSIMASN*.go';  DestPath = $Aptos.AsnInPath }
+)
+
+# Aptos -> Blue Yonder purchase orders.
+$PoPattern = '*'   # purchase orders from Aptos
 
 # ===========================================================================
 # IMPLEMENTATION  --  no edits needed below
@@ -188,28 +182,10 @@ function Invoke-TransferFlow {
         [string]$Name,
         [WinSCP.Session]$SourceSession, [string]$SourceDir,
         [WinSCP.Session]$DestSession,   [string]$DestDir,
-        [string]$Pattern,
-        [string]$ArchiveDir,      # folder on the SOURCE server to move files into after a verified upload
-        [string]$DestArchiveDir   # folder on the DESTINATION server to copy delivered files into (optional)
+        [string]$Pattern
     )
 
     Write-Log "=== FLOW: $Name ==="
-
-    # Ensure the source-server archive folder exists (idempotent).
-    if ($ArchiveSource -and $ArchiveDir) {
-        if (-not $SourceSession.FileExists($ArchiveDir)) {
-            Write-Log "Creating archive folder on source: $ArchiveDir"
-            $SourceSession.CreateDirectory($ArchiveDir)
-        }
-    }
-
-    # Ensure the destination-server archive folder exists (idempotent), only when enabled.
-    if ($ArchiveDestination -and $DestArchiveDir) {
-        if (-not $DestSession.FileExists($DestArchiveDir)) {
-            Write-Log "Creating archive folder on destination: $DestArchiveDir"
-            $DestSession.CreateDirectory($DestArchiveDir)
-        }
-    }
 
     $remoteItems = $SourceSession.ListDirectory($SourceDir).Files |
         Where-Object { -not $_.IsDirectory -and $_.Name -like $Pattern }
@@ -229,62 +205,68 @@ function Invoke-TransferFlow {
         $remoteSrcPath = ($SourceDir.TrimEnd('/')) + '/' + $name
         $localPath     = Join-Path $StagingPath $name
         $remoteDstPath = ($DestDir.TrimEnd('/')) + '/' + $name
-        $remoteArchivePath = if ($ArchiveDir) { ($ArchiveDir.TrimEnd('/')) + '/' + $name } else { $null }
-        $remoteDestArchivePath = if ($DestArchiveDir) { ($DestArchiveDir.TrimEnd('/')) + '/' + $name } else { $null }
 
         if (-not $PSCmdlet.ShouldProcess($name, "Transfer ($Name)")) {
             Write-Log "[WhatIf] Would transfer $remoteSrcPath -> $remoteDstPath"
             continue
         }
 
+        # Legacy DataExchange/JDA transfer pattern (from the original job logs):
+        #
+        #  PICKUP (source):  download to local .TMP, rename remote source to .RN
+        #                    (claim it), rename local .TMP to final, delete .RN.
+        #  DELIVERY (dest):  upload to remote .TMP, then rename remote .TMP to the
+        #                    final name so the receiving app never sees a partial file.
+        #
+        # Both directions are a MOVE: the source file is consumed after success.
+        $localTmp       = $localPath + '.TMP'
+        $remoteSrcRN    = $remoteSrcPath + '.RN'    # claimed/renamed source on the source server
+        $remoteDstTmp   = $remoteDstPath + '.TMP'   # in-progress upload name on the destination
+
         try {
-            # 1. Download source -> staging
-            Write-Log "Download $remoteSrcPath -> $localPath"
-            $SourceSession.GetFiles($remoteSrcPath, $localPath, $false, $transferOpts).Check()
+            # 1. Download source -> local .TMP (partial downloads are not mistaken
+            #    for complete files).
+            Write-Log "getFile(): $remoteSrcPath -> $localTmp"
+            $SourceSession.GetFiles($remoteSrcPath, $localTmp, $false, $transferOpts).Check()
 
-            if (-not (Test-Path $localPath)) {
-                Write-Log "Download produced no local file: $localPath" 'ERROR'
+            if (-not (Test-Path $localTmp)) {
+                Write-Log "Download produced no local file: $localTmp" 'ERROR'
                 continue
             }
 
-            # 2. Upload staging -> destination
-            Write-Log "Upload $localPath -> $remoteDstPath"
-            $DestSession.PutFiles($localPath, $remoteDstPath, $false, $transferOpts).Check()
+            # 2. Claim the source by renaming it to .RN on the source server.
+            Write-Log "renameRemoteFile(): $remoteSrcPath -> $remoteSrcRN"
+            $SourceSession.MoveFile($remoteSrcPath, $remoteSrcRN)
 
-            # 3. Verify on destination
+            # 3. Rename local .TMP to its final name (download now complete).
+            if (Test-Path $localPath) { Remove-Item $localPath -Force -ErrorAction SilentlyContinue }
+            Rename-Item -Path $localTmp -NewName $name
+            Write-Log "Renamed local $localTmp -> $localPath"
+
+            # 4. Upload local file to a remote .TMP name on the destination.
+            Write-Log "sendFile(): $localPath -> $remoteDstTmp"
+            $DestSession.PutFiles($localPath, $remoteDstTmp, $false, $transferOpts).Check()
+
+            # 5. Rename remote .TMP to the final name so the receiving app only
+            #    ever sees a complete file (atomic reveal).
+            Write-Log "renameRemoteFile(): $remoteDstTmp -> $remoteDstPath"
+            $DestSession.MoveFile($remoteDstTmp, $remoteDstPath)
+
             if (-not $DestSession.FileExists($remoteDstPath)) {
-                Write-Log "Upload verification failed: $remoteDstPath not found on destination." 'ERROR'
+                Write-Log "Delivery verification failed: $remoteDstPath not found on destination." 'ERROR'
                 continue
             }
-            Write-Log "Verified on destination: $remoteDstPath"
+            Write-Log "Delivered to destination: $remoteDstPath"
 
-            # 4. Archive the source file (move within the source server) after a
-            #    verified upload. This replaces deletion: the original is preserved
-            #    under the source server's archive folder.
-            if ($ArchiveSource -and $remoteArchivePath) {
-                Write-Log "Archiving source $remoteSrcPath -> $remoteArchivePath"
-                # MoveFile(sourcePath, targetPath). WinSCP overwrites if the target
-                # already exists; the target name matches the original file name.
-                $SourceSession.MoveFile($remoteSrcPath, $remoteArchivePath)
-                if (-not $SourceSession.FileExists($remoteArchivePath)) {
-                    Write-Log "Archive verification failed: $remoteArchivePath not found after move." 'ERROR'
-                    continue
-                }
-                Write-Log "Archived on source: $remoteArchivePath"
+            # 6. Remove the claimed source file (.RN) from the source server.
+            #    Gated behind -DeleteSourceAfter as a safety measure: without it,
+            #    the claimed .RN file is left in place and nothing is deleted.
+            if ($DeleteSourceAfter) {
+                Write-Log "removeRemoteFile(): $remoteSrcRN"
+                $SourceSession.RemoveFiles($remoteSrcRN).Check()
             }
-
-            # 4b. Optionally keep an archive COPY on the destination server. The
-            #     delivered file in $DestDir is left in place for the receiving
-            #     application; a second copy is placed in the destination archive
-            #     folder. Re-uploads the already-verified local staging copy.
-            if ($ArchiveDestination -and $remoteDestArchivePath) {
-                Write-Log "Archiving on destination (copy) $localPath -> $remoteDestArchivePath"
-                $DestSession.PutFiles($localPath, $remoteDestArchivePath, $false, $transferOpts).Check()
-                if (-not $DestSession.FileExists($remoteDestArchivePath)) {
-                    Write-Log "Destination archive verification failed: $remoteDestArchivePath not found." 'ERROR'
-                    continue
-                }
-                Write-Log "Archived on destination: $remoteDestArchivePath"
+            else {
+                Write-Log "DeleteSourceAfter not set; leaving claimed source in place: $remoteSrcRN"
             }
 
             $count++
@@ -293,7 +275,8 @@ function Invoke-TransferFlow {
             Write-Log "Error transferring '$name': $($_.Exception.Message)" 'ERROR'
         }
         finally {
-            # 5. Always clean up staging copy
+            # Always clean up any local staging copies (.TMP and final).
+            if (Test-Path $localTmp)  { Remove-Item $localTmp  -Force -ErrorAction SilentlyContinue }
             if (Test-Path $localPath) { Remove-Item $localPath -Force -ErrorAction SilentlyContinue }
         }
     }
@@ -320,21 +303,21 @@ try {
     $aptosSession = New-WinScpSession -Endpoint $Aptos      -Role 'Aptos'
 
     if ($Mode -in @('Both', 'InvoicesOnly')) {
-        Invoke-TransferFlow -Name 'INVOICES Blue Yonder -> Aptos' `
-            -SourceSession $byeSession   -SourceDir $BlueYonder.OutboxPath `
-            -DestSession   $aptosSession -DestDir   $Aptos.InvoicesInPath `
-            -Pattern $InvoicePattern `
-            -ArchiveDir $BlueYonder.ArchivePath `
-            -DestArchiveDir $Aptos.DestArchivePath
+        # One flow per routing rule: same Blue Yonder outbox, different Aptos
+        # destination per filename pattern (invoices, ASN, ...).
+        foreach ($route in $OutboundRoutes) {
+            Invoke-TransferFlow -Name "$($route.Label) Blue Yonder -> Aptos" `
+                -SourceSession $byeSession   -SourceDir $BlueYonder.OutboxPath `
+                -DestSession   $aptosSession -DestDir   $route.DestPath `
+                -Pattern $route.Pattern
+        }
     }
 
     if ($Mode -in @('Both', 'PosOnly')) {
         Invoke-TransferFlow -Name 'PURCHASE ORDERS Aptos -> Blue Yonder' `
             -SourceSession $aptosSession -SourceDir $Aptos.PurchaseOutPath `
             -DestSession   $byeSession   -DestDir   $BlueYonder.InboxPath `
-            -Pattern $PoPattern `
-            -ArchiveDir $Aptos.ArchivePath `
-            -DestArchiveDir $BlueYonder.DestArchivePath
+            -Pattern $PoPattern
     }
 
     Write-Log "All requested flows completed."
