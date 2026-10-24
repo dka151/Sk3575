@@ -10,8 +10,8 @@
       created the DPAPI credential files). The CmdExec step therefore runs as
       that account automatically -- NO proxy required -- because this job is
       owned by a sysadmin login (sa).
-    - Sync-BlueYonder-Aptos.ps1 deployed to C:\sftp on vwpsftp01.
-    - Credential files created under C:\sftp\creds by WSS\vwpsftp01sql.
+    - Sync-BlueYonder-Aptos.ps1 deployed to D:\sftp on vwpsftp01.
+    - Credential files created under D:\sftp\creds by WSS\vwpsftp01sql.
     - SSH host key fingerprints pasted into the script.
 
   BEHAVIOUR
@@ -65,7 +65,7 @@ EXEC msdb.dbo.sp_add_jobstep
     @step_name       = N'Run transfer (both flows)',
     @step_id         = 1,
     @subsystem       = N'CmdExec',
-    @command         = N'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "& ''C:\sftp\Sync-BlueYonder-Aptos.ps1'' -Mode Both -DeleteSourceAfter; exit $LASTEXITCODE"',
+    @command         = N'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "& ''D:\sftp\Sync-BlueYonder-Aptos.ps1'' -Mode Both -DeleteSourceAfter; exit $LASTEXITCODE"',
     @on_success_action = 1,   -- 1 = Quit the job reporting success
     @on_fail_action    = 2,   -- 2 = Quit the job reporting failure
     @retry_attempts    = 0,

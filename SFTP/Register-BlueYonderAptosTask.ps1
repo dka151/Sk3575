@@ -29,14 +29,14 @@
 
 .EXAMPLE
     .\Register-BlueYonderAptosTask.ps1 -ServiceAccount 'DOMAIN\svc-sftp' `
-        -ScriptPath 'C:\sftp\Sync-BlueYonder-Aptos.ps1' -StartTime '02:00' -RepeatMinutes 30
+        -ScriptPath 'D:\sftp\Sync-BlueYonder-Aptos.ps1' -StartTime '02:00' -RepeatMinutes 30
 #>
 
 [CmdletBinding()]
 param(
     [string]$TaskName       = 'BlueYonder-Aptos SFTP Transfer',
     [Parameter(Mandatory)] [string]$ServiceAccount,
-    [string]$ScriptPath     = 'C:\sftp\Sync-BlueYonder-Aptos.ps1',
+    [string]$ScriptPath     = 'D:\sftp\Sync-BlueYonder-Aptos.ps1',
     [string]$StartTime      = '02:00',
     [int]$RepeatMinutes     = 0
 )

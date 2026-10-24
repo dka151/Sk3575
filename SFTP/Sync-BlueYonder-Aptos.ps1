@@ -7,10 +7,10 @@
 
     Flows per run (mirroring the original job):
       INVOICES -> APTOS : Blue Yonder /home/eurorpatprdv2/outbox (STSIMATIN*.go)
-                          -> Aptos /Transfer/IN/Merch/Invoices/Company1
+                          -> Aptos /IN/Merch/Invoices/Company1
       ASN      -> APTOS : Blue Yonder /home/eurorpatprdv2/outbox (STSIMASN*.go)
-                          -> Aptos '/Transfer/IN/Merch/EDI ASN'
-      POS      -> BY    : Aptos /Transfer/Out/Merch/PurchaseOrder
+                          -> Aptos '/IN/Merch/EDI ASN'
+      POS      -> BY    : Aptos /Out/Merch/PurchaseOrder
                           -> Blue Yonder /home/eurorpatprdv2/inbox
 
     Outbound (Blue Yonder -> Aptos) routing is table-driven via $OutboundRoutes:
@@ -68,10 +68,10 @@ param(
     [ValidateSet('Both', 'InvoicesOnly', 'PosOnly')]
     [string]$Mode = 'Both',
 
-    [string]$CredentialFolder = 'C:\sftp\creds',
-    [string]$StagingPath      = 'C:\sftp\staging',
-    [string]$LogPath          = 'C:\sftp\logs\blueyonder-aptos.log',
-    [string]$WinScpLogPath    = 'C:\sftp\logs\winscp-session.log',
+    [string]$CredentialFolder = 'D:\sftp\creds',
+    [string]$StagingPath      = 'D:\sftp\staging',
+    [string]$LogPath          = 'D:\sftp\logs\blueyonder-aptos.log',
+    [string]$WinScpLogPath    = 'D:\sftp\logs\winscp-session.log',
 
     # Safety switch. When supplied, the claimed source file (renamed to .RN during
     # pickup) is DELETED after a verified delivery -- a true MOVE, matching the
@@ -192,7 +192,7 @@ function New-WinScpSession {
 
 function Get-EndpointWinScpLogPath {
     # Builds a per-endpoint WinSCP session log path from $WinScpLogPath, e.g.
-    #   C:\sftp\logs\winscp-session.log -> C:\sftp\logs\winscp-session.BlueYonder.log
+    #   D:\sftp\logs\winscp-session.log -> D:\sftp\logs\winscp-session.BlueYonder.log
     param([string]$Role)
     $dir  = Split-Path -Parent $WinScpLogPath
     $base = [System.IO.Path]::GetFileNameWithoutExtension($WinScpLogPath)

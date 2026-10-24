@@ -20,9 +20,9 @@ deleted, making it a MOVE.
 
 | Flow | Source | Pattern | Destination |
 |------|--------|---------|-------------|
-| Invoices | Blue Yonder `PRODB2BGW02.jdadelivers.com:/home/eurorpatprdv2/outbox` | `STSIMATIN*.go` | Aptos `10.252.16.100:/Transfer/IN/Merch/Invoices/Company1` |
-| ASN | Blue Yonder `PRODB2BGW02.jdadelivers.com:/home/eurorpatprdv2/outbox` | `STSIMASN*.go` | Aptos `10.252.16.100:/Transfer/IN/Merch/EDI ASN` |
-| Purchase Orders | Aptos `10.252.16.100:/Transfer/Out/Merch/PurchaseOrder` | `*` | Blue Yonder `PRODB2BGW02.jdadelivers.com:/home/eurorpatprdv2/inbox` |
+| Invoices | Blue Yonder `PRODB2BGW02.jdadelivers.com:/home/eurorpatprdv2/outbox` | `STSIMATIN*.go` | Aptos `10.252.16.100:/IN/Merch/Invoices/Company1` |
+| ASN | Blue Yonder `PRODB2BGW02.jdadelivers.com:/home/eurorpatprdv2/outbox` | `STSIMASN*.go` | Aptos `10.252.16.100:/IN/Merch/EDI ASN` |
+| Purchase Orders | Aptos `10.252.16.100:/Out/Merch/PurchaseOrder` | `*` | Blue Yonder `PRODB2BGW02.jdadelivers.com:/home/eurorpatprdv2/inbox` |
 
 Invoices and ASN share the same Blue Yonder outbox and are routed to different
 Aptos folders by filename pattern. The routing is table-driven in the script
@@ -51,7 +51,7 @@ without it, delivery still completes but the claimed `.RN` is left on the source
 > Passwords are never stored in the scripts. They live in DPAPI-encrypted
 > credential files created in step 3.
 
-## Files (deploy these to `C:\sftp\` on vwpsftp01)
+## Files (deploy these to `D:\sftp\` on vwpsftp01)
 
 - `Sync-BlueYonder-Aptos.ps1` — the transfer job
 - `New-BlueYonderAptosCreds.ps1` — one-time credential file creator
@@ -61,7 +61,7 @@ without it, delivery still completes but the claimed `.RN` is left on the source
 Suggested layout on vwpsftp01:
 
 ```
-C:\sftp\
+D:\sftp\
   Sync-BlueYonder-Aptos.ps1
   New-BlueYonderAptosCreds.ps1
   Deploy-BlueYonderAptosJob.sql
@@ -134,21 +134,21 @@ decryption works). Use PsExec if `runas` is blocked for the service account:
 ```powershell
 C:\Tools\PSTools\PsExec.exe -accepteula -u WSS\vwpsftp01sql -i powershell.exe
 # in the new window:
-cd C:\sftp
-.\New-BlueYonderAptosCreds.ps1 -OutputFolder 'C:\sftp\creds'
+cd D:\sftp
+.\New-BlueYonderAptosCreds.ps1 -OutputFolder 'D:\sftp\creds'
 ```
-Produces `C:\sftp\creds\blueyonder.cred.xml` and `aptos.cred.xml`.
-Lock down `C:\sftp\creds` so only the service account and admins can read it.
+Produces `D:\sftp\creds\blueyonder.cred.xml` and `aptos.cred.xml`.
+Lock down `D:\sftp\creds` so only the service account and admins can read it.
 
 ### 5. Test before scheduling
 Run as the service account (`WSS\vwpsftp01sql`):
 ```powershell
-cd C:\sftp
+cd D:\sftp
 .\Sync-BlueYonder-Aptos.ps1 -WhatIf              # lists what WOULD transfer, moves nothing
 .\Sync-BlueYonder-Aptos.ps1                      # deliver; leave claimed source (.RN) in place (safety mode)
 .\Sync-BlueYonder-Aptos.ps1 -DeleteSourceAfter   # full MOVE: delete claimed source after verified delivery
 ```
-Check `C:\sftp\logs\blueyonder-aptos.log` and confirm files landed on both sides.
+Check `D:\sftp\logs\blueyonder-aptos.log` and confirm files landed on both sides.
 Run `-DeleteSourceAfter` (the production behaviour) only once you are satisfied
 delivery is working. Note: every run claims the source by renaming it to `.RN`;
 without `-DeleteSourceAfter` those `.RN` files stay on the source until a run
@@ -162,7 +162,7 @@ owns the credential files — so a CmdExec step runs as that account automatical
 Deploy the job by running the included `Deploy-BlueYonderAptosJob.sql` on the SQL
 instance on vwpsftp01:
 ```powershell
-sqlcmd -S vwpsftp01 -E -i "C:\sftp\Deploy-BlueYonderAptosJob.sql"
+sqlcmd -S vwpsftp01 -E -i "D:\sftp\Deploy-BlueYonderAptosJob.sql"
 ```
 (or open it in SSMS and execute). The script is re-runnable — it drops and
 recreates the job — and creates a CmdExec step plus a daily 02:00 schedule.
@@ -186,9 +186,9 @@ To tweak behaviour, edit `Deploy-BlueYonderAptosJob.sql` before running:
 ### Alternative: Windows Task Scheduler
 If you prefer Task Scheduler over SQL Agent, use the included script:
 ```powershell
-cd C:\sftp
+cd D:\sftp
 .\Register-BlueYonderAptosTask.ps1 -ServiceAccount 'WSS\vwpsftp01sql' `
-    -ScriptPath 'C:\sftp\Sync-BlueYonder-Aptos.ps1' `
+    -ScriptPath 'D:\sftp\Sync-BlueYonder-Aptos.ps1' `
     -StartTime '02:00' -RepeatMinutes 30
 ```
 
@@ -205,9 +205,10 @@ WHERE j.name = N'BlueYonder-Aptos SFTP Transfer'
 ORDER BY h.run_date DESC, h.run_time DESC;
 ```
 ```powershell
-# Logs (same regardless of scheduler)
-Get-Content C:\sftp\logs\blueyonder-aptos.log -Tail 50
-Get-Content C:\sftp\logs\winscp-session.log  -Tail 50
+# Logs (same regardless of scheduler; recreated fresh each run)
+Get-Content D:\sftp\logs\blueyonder-aptos.log          -Tail 50
+Get-Content D:\sftp\logs\winscp-session.BlueYonder.log -Tail 50
+Get-Content D:\sftp\logs\winscp-session.Aptos.log      -Tail 50
 ```
 
 ### Run modes
