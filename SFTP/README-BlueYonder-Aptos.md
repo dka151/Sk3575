@@ -68,7 +68,7 @@ D:\sftp\
   Register-BlueYonderAptosTask.ps1
   creds\      <- credential files (step 3)
   staging\    <- transient; files pass through here
-  logs\       <- transfer + WinSCP session logs
+  logs\       <- timestamped per-run logs (pruned by the job's retention step)
 ```
 
 ## One-time setup on vwpsftp01
@@ -148,7 +148,12 @@ cd D:\sftp
 .\Sync-BlueYonder-Aptos.ps1                      # deliver; leave claimed source (.RN) in place (safety mode)
 .\Sync-BlueYonder-Aptos.ps1 -DeleteSourceAfter   # full MOVE: delete claimed source after verified delivery
 ```
-Check `D:\sftp\logs\blueyonder-aptos.log` and confirm files landed on both sides.
+Check the latest run log (each run writes its own timestamped file,
+`D:\sftp\logs\blueyonder-aptos_<yyyyMMdd-HHmmss>.log`) and confirm files landed
+on both sides:
+```powershell
+Get-Content (Get-ChildItem D:\sftp\logs\blueyonder-aptos_*.log | Sort-Object LastWriteTime | Select-Object -Last 1) -Tail 50
+```
 Run `-DeleteSourceAfter` (the production behaviour) only once you are satisfied
 delivery is working. Note: every run claims the source by renaming it to `.RN`;
 without `-DeleteSourceAfter` those `.RN` files stay on the source until a run
@@ -165,23 +170,34 @@ instance on vwpsftp01:
 sqlcmd -S vwpsftp01 -E -i "D:\sftp\Deploy-BlueYonderAptosJob.sql"
 ```
 (or open it in SSMS and execute). The script is re-runnable — it drops and
-recreates the job — and creates a CmdExec step plus a daily 02:00 schedule.
+recreates the job — and creates a two-step job plus an every-15-minutes schedule.
 
 What the script sets up:
-- Job owned by `sa` (sysadmin) so the CmdExec step runs as the Agent service
+- Job owned by `sa` (sysadmin) so the CmdExec steps run as the Agent service
   account `WSS\vwpsftp01sql`. No proxy/SQL credential needed. (If the job must be
   owned by a non-sysadmin, create a CmdExec proxy bound to a `WSS\vwpsftp01sql`
   credential instead.)
-- Production behaviour: both flows, legacy `.TMP`/`.RN` pattern, `-DeleteSourceAfter`
-  passed (true MOVE — claimed source deleted after a verified delivery).
-- `exit $LASTEXITCODE` plus the script's `exit 1` on failure make SQL Agent mark
-  the step FAILED when a transfer errors (otherwise it could show success).
+- **Step 1 — Run transfer (both flows):** legacy `.TMP`/`.RN` pattern,
+  `-DeleteSourceAfter` passed (true MOVE — claimed source deleted after a
+  verified delivery). `exit $LASTEXITCODE` plus the script's `exit 1` on failure
+  make SQL Agent mark the step FAILED when a transfer errors.
+- **Step 2 — Log retention cleanup:** deletes timestamped log files older than
+  `@RetentionDays` (default 30) from `D:\sftp\logs`.
+
+Step flow: on Step 1 success the job proceeds to Step 2; on Step 1 failure the
+job quits reporting failure (so a transfer error is visible and cleanup is
+skipped that run — the next successful run prunes logs). Step 2 never fails the
+job, so a cleanup hiccup won't raise a false failure.
 
 To tweak behaviour, edit `Deploy-BlueYonderAptosJob.sql` before running:
-- **Test/safety mode:** remove `-DeleteSourceAfter` from the step `@command` to
+- **Retention policy:** change `DECLARE @RetentionDays int = 30;` in Step 2.
+- **Test/safety mode:** remove `-DeleteSourceAfter` from the Step 1 `@command` to
   leave claimed `.RN` source files in place (nothing deleted).
-- **Every-30-min schedule:** swap in the alternative `sp_add_schedule` block
-  included (commented) at the bottom of the SQL file.
+- **Schedule cadence:** the active schedule runs every 15 minutes. Change
+  `@freq_subday_interval` in the `sp_add_schedule` block (e.g. 30 for every 30
+  minutes), or swap in the commented daily-once block at the bottom of the SQL
+  file. Note: a 15-minute cadence produces many log files, so consider a shorter
+  `@RetentionDays` (e.g. 7).
 
 ### Alternative: Windows Task Scheduler
 If you prefer Task Scheduler over SQL Agent, use the included script:
@@ -189,7 +205,7 @@ If you prefer Task Scheduler over SQL Agent, use the included script:
 cd D:\sftp
 .\Register-BlueYonderAptosTask.ps1 -ServiceAccount 'WSS\vwpsftp01sql' `
     -ScriptPath 'D:\sftp\Sync-BlueYonder-Aptos.ps1' `
-    -StartTime '02:00' -RepeatMinutes 30
+    -StartTime '00:00' -RepeatMinutes 15
 ```
 
 ## Operations
@@ -204,12 +220,22 @@ JOIN msdb.dbo.sysjobhistory h ON h.job_id = j.job_id
 WHERE j.name = N'BlueYonder-Aptos SFTP Transfer'
 ORDER BY h.run_date DESC, h.run_time DESC;
 ```
-```powershell
-# Logs (same regardless of scheduler; recreated fresh each run)
-Get-Content D:\sftp\logs\blueyonder-aptos.log          -Tail 50
-Get-Content D:\sftp\logs\winscp-session.BlueYonder.log -Tail 50
-Get-Content D:\sftp\logs\winscp-session.Aptos.log      -Tail 50
+Each run writes its OWN timestamped log files (never overwritten), named:
 ```
+D:\sftp\logs\blueyonder-aptos_<yyyyMMdd-HHmmss>.log
+D:\sftp\logs\winscp-session.BlueYonder_<yyyyMMdd-HHmmss>.log
+D:\sftp\logs\winscp-session.Aptos_<yyyyMMdd-HHmmss>.log
+```
+Tail the most recent of each (same regardless of scheduler):
+```powershell
+# Latest script log
+Get-Content (Get-ChildItem D:\sftp\logs\blueyonder-aptos_*.log          | Sort-Object LastWriteTime | Select-Object -Last 1) -Tail 50
+# Latest WinSCP session logs
+Get-Content (Get-ChildItem D:\sftp\logs\winscp-session.BlueYonder_*.log | Sort-Object LastWriteTime | Select-Object -Last 1) -Tail 50
+Get-Content (Get-ChildItem D:\sftp\logs\winscp-session.Aptos_*.log      | Sort-Object LastWriteTime | Select-Object -Last 1) -Tail 50
+```
+Old log files are pruned automatically by the job's Step 2 (retention policy,
+default 30 days).
 
 ### Run modes
 ```powershell
@@ -230,7 +256,8 @@ Get-Content D:\sftp\logs\winscp-session.Aptos.log      -Tail 50
 
 ## Outstanding items to confirm
 - **Rotate the Blue Yonder password** after go-live, since it was shared during setup.
-- **Schedule cadence:** confirm desired run time / frequency (default: daily 02:00).
+- **Schedule cadence:** currently every 15 minutes. Confirm this frequency is
+  desired (and that overlapping runs can't occur — see note below).
 - **Transfer behaviour:** production uses the legacy `.TMP`/`.RN` move pattern with
   `-DeleteSourceAfter` (claimed source deleted after a verified delivery). Omitting
   the switch is test/safety mode and leaves `.RN` files on the source.

@@ -83,6 +83,30 @@ param(
 $ErrorActionPreference = 'Stop'
 
 # ===========================================================================
+# PER-RUN TIMESTAMPED LOG FILES  --  every run writes to its OWN log files, so
+# nothing is ever overwritten or appended. The $LogPath / $WinScpLogPath params
+# above are treated as BASE names; a run timestamp (yyyyMMdd-HHmmss) is inserted
+# before the extension, e.g.:
+#   D:\sftp\logs\blueyonder-aptos.log
+#     -> D:\sftp\logs\blueyonder-aptos_20261024-020003.log
+#   D:\sftp\logs\winscp-session.log
+#     -> D:\sftp\logs\winscp-session.BlueYonder_20261024-020003.log
+# ===========================================================================
+$script:RunStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+
+function Add-RunStamp {
+    # Inserts the run timestamp before the file extension of a base path.
+    param([string]$BasePath)
+    $dir  = Split-Path -Parent $BasePath
+    $base = [System.IO.Path]::GetFileNameWithoutExtension($BasePath)
+    $ext  = [System.IO.Path]::GetExtension($BasePath)
+    return (Join-Path $dir ("{0}_{1}{2}" -f $base, $script:RunStamp, $ext))
+}
+
+# Resolve the script log to a timestamped file for this run.
+$LogPath = Add-RunStamp -BasePath $LogPath
+
+# ===========================================================================
 # CONFIGURATION  --  values from the legacy DataExchange/JDA job
 # ===========================================================================
 
@@ -191,14 +215,15 @@ function New-WinScpSession {
 }
 
 function Get-EndpointWinScpLogPath {
-    # Builds a per-endpoint WinSCP session log path from $WinScpLogPath, e.g.
-    #   D:\sftp\logs\winscp-session.log -> D:\sftp\logs\winscp-session.BlueYonder.log
+    # Builds a per-endpoint, per-run WinSCP session log path from $WinScpLogPath, e.g.
+    #   D:\sftp\logs\winscp-session.log
+    #     -> D:\sftp\logs\winscp-session.BlueYonder_20261024-020003.log
     param([string]$Role)
     $dir  = Split-Path -Parent $WinScpLogPath
     $base = [System.IO.Path]::GetFileNameWithoutExtension($WinScpLogPath)
     $ext  = [System.IO.Path]::GetExtension($WinScpLogPath)
     $safeRole = ($Role -replace '\s', '')   # "Blue Yonder" -> "BlueYonder"
-    return (Join-Path $dir ("{0}.{1}{2}" -f $base, $safeRole, $ext))
+    return (Join-Path $dir ("{0}.{1}_{2}{3}" -f $base, $safeRole, $script:RunStamp, $ext))
 }
 
 function Invoke-TransferFlow {
@@ -358,14 +383,10 @@ foreach ($dir in @($StagingPath, (Split-Path $LogPath), (Split-Path $WinScpLogPa
     if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
 }
 
-# Start each run with FRESH log files -- remove any previous run's logs so this
-# run never amends an older file. This covers the script log plus the base
-# WinSCP session log and the per-endpoint session logs (winscp-session.*.log).
-$logsToReset = @($LogPath, $WinScpLogPath)
-$logsToReset += @('Blue Yonder', 'Aptos') | ForEach-Object { Get-EndpointWinScpLogPath -Role $_ }
-foreach ($log in ($logsToReset | Select-Object -Unique)) {
-    if ($log -and (Test-Path $log)) { Remove-Item $log -Force -ErrorAction SilentlyContinue }
-}
+# NOTE: no log deletion here. Each run writes to its OWN timestamped log files
+# ($RunStamp), so nothing is ever overwritten or appended. Previous runs' logs
+# are preserved for history. (See the optional retention cleanup below if you
+# want to cap how many old logs are kept.)
 
 if (-not (Test-Path $WinScpDllPath)) {
     throw "WinSCP .NET assembly not found at '$WinScpDllPath'. Install WinSCP or correct the path."

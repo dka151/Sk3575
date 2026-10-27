@@ -26,9 +26,19 @@
     - 'exit $LASTEXITCODE' + the script's 'exit 1' on failure make the step
       report FAILURE to SQL Agent when a transfer errors.
 
+  STEPS
+    1. Run transfer (both flows)  -- the SFTP move.
+    2. Log retention cleanup      -- deletes timestamped log files older than
+                                     @RetentionDays from D:\sftp\logs.
+
   SCHEDULE
-    - Daily at 02:00. Adjust @active_start_time / add a sub-day repetition if a
-      more frequent cadence is required.
+    - Every 15 minutes, all day, every day. Adjust @freq_subday_interval below
+      for a different cadence (or see the commented daily-once block at the end).
+
+  LOG RETENTION
+    - Each run writes its own timestamped log files (never overwritten). Step 2
+      prunes files older than @RetentionDays (default 30) so they don't grow
+      without bound. Change @RetentionDays below to adjust the policy.
 
   Run this script on the SQL instance on vwpsftp01 (sqlcmd or SSMS).
   Re-runnable: it drops the job first if it already exists.
@@ -53,38 +63,74 @@ EXEC msdb.dbo.sp_add_job
     @job_name         = N'BlueYonder-Aptos SFTP Transfer',
     @enabled          = 1,
     @owner_login_name = N'sa',
-    @description      = N'Transfers invoices Blue Yonder->Aptos and purchase orders Aptos->Blue Yonder via vwpsftp01 (WinSCP). Legacy .TMP/.RN move pattern; deletes source after verified delivery. Replaces legacy DataExchange/JDA job.';
+    @description      = N'Transfers invoices Blue Yonder->Aptos and purchase orders Aptos->Blue Yonder via vwpsftp01 (WinSCP). Legacy .TMP/.RN move pattern; deletes source after verified delivery. Step 2 prunes log files older than the retention period. Replaces legacy DataExchange/JDA job.';
 GO
 
-/* ---- Job step: run the PowerShell transfer via CmdExec ---- */
+/* ---- Step 1: run the PowerShell transfer via CmdExec ---- */
 /* NOTE: -DeleteSourceAfter makes this a true MOVE (source consumed after a
          verified delivery). Remove it to run in test/safety mode (claimed .RN
-         source left in place, nothing deleted).                                */
+         source left in place, nothing deleted).
+   On success -> go to Step 2 (log cleanup). On failure -> quit reporting
+   failure (so a transfer error is visible; cleanup is skipped that run and the
+   next successful run prunes logs).                                            */
 EXEC msdb.dbo.sp_add_jobstep
     @job_name        = N'BlueYonder-Aptos SFTP Transfer',
     @step_name       = N'Run transfer (both flows)',
     @step_id         = 1,
     @subsystem       = N'CmdExec',
     @command         = N'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "& ''D:\sftp\Sync-BlueYonder-Aptos.ps1'' -Mode Both -DeleteSourceAfter; exit $LASTEXITCODE"',
-    @on_success_action = 1,   -- 1 = Quit the job reporting success
+    @on_success_action = 3,   -- 3 = Go to the next step
     @on_fail_action    = 2,   -- 2 = Quit the job reporting failure
     @retry_attempts    = 0,
     @retry_interval    = 0;
 GO
 
-/* ---- Schedule: daily at 02:00 ---- */
+/* ---- Step 2: log retention cleanup ----
+   Deletes timestamped log files older than @RetentionDays from D:\sftp\logs.
+   Matches the files the transfer script creates:
+     blueyonder-aptos_*.log
+     winscp-session.*_*.log
+   To change the retention period, edit the -RetentionDays value below.         */
+DECLARE @RetentionDays int = 30;   -- <<< retention policy: keep logs this many days
+
+DECLARE @CleanupCmd nvarchar(2000) = N'powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command '
+    + N'"$ret=' + CAST(@RetentionDays AS nvarchar(10)) + N'; '
+    + N'$cut=(Get-Date).AddDays(-$ret); '
+    + N'$logs=''D:\sftp\logs''; '
+    + N'$patterns=@(''blueyonder-aptos_*.log'',''winscp-session.*_*.log''); '
+    + N'foreach($p in $patterns){ '
+    + N'Get-ChildItem -Path $logs -Filter $p -File -ErrorAction SilentlyContinue '
+    + N'| Where-Object { $_.LastWriteTime -lt $cut } '
+    + N'| ForEach-Object { Write-Host (''Deleting '' + $_.FullName); Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue } }; '
+    + N'exit 0"';
+
+EXEC msdb.dbo.sp_add_jobstep
+    @job_name        = N'BlueYonder-Aptos SFTP Transfer',
+    @step_name       = N'Log retention cleanup',
+    @step_id         = 2,
+    @subsystem       = N'CmdExec',
+    @command         = @CleanupCmd,
+    @on_success_action = 1,   -- 1 = Quit the job reporting success
+    @on_fail_action    = 1,   -- 1 = Quit reporting success (cleanup failure must not fail the job)
+    @retry_attempts    = 0,
+    @retry_interval    = 0;
+GO
+
+/* ---- Schedule: every 15 minutes, all day, every day ---- */
 EXEC msdb.dbo.sp_add_schedule
-    @schedule_name     = N'SFTP_BlueYonderAptos_Daily_0200',
-    @enabled           = 1,
-    @freq_type         = 4,          -- 4 = daily
-    @freq_interval     = 1,          -- every 1 day
-    @freq_subday_type  = 1,          -- 1 = at the specified time (once)
-    @active_start_time = 020000;     -- 02:00:00  (HHMMSS)
+    @schedule_name        = N'SFTP_BlueYonderAptos_Every15',
+    @enabled              = 1,
+    @freq_type            = 4,          -- 4 = daily
+    @freq_interval        = 1,          -- every 1 day
+    @freq_subday_type     = 4,          -- 4 = minutes
+    @freq_subday_interval = 15,         -- every 15 minutes
+    @active_start_time    = 000000,     -- from 00:00:00
+    @active_end_time      = 235959;     -- to 23:59:59  (HHMMSS)
 GO
 
 EXEC msdb.dbo.sp_attach_schedule
     @job_name      = N'BlueYonder-Aptos SFTP Transfer',
-    @schedule_name = N'SFTP_BlueYonderAptos_Daily_0200';
+    @schedule_name = N'SFTP_BlueYonderAptos_Every15';
 GO
 
 /* ---- Target the local server ---- */
@@ -98,18 +144,19 @@ GO
 
 /*
 --------------------------------------------------------------------------------
-  OPTIONAL: run every 30 minutes across the day instead of once at 02:00.
-  Replace the sp_add_schedule call above with:
+  The active schedule above runs every 15 minutes. To change the cadence, edit
+  @freq_subday_interval (e.g. 30 for every 30 minutes).
+
+  OPTIONAL: run once daily at 02:00 instead. Replace the sp_add_schedule call
+  above with:
 
   EXEC msdb.dbo.sp_add_schedule
-      @schedule_name        = N'SFTP_BlueYonderAptos_Every30',
-      @enabled              = 1,
-      @freq_type            = 4,        -- daily
-      @freq_interval        = 1,
-      @freq_subday_type     = 4,        -- 4 = minutes
-      @freq_subday_interval = 30,       -- every 30 minutes
-      @active_start_time    = 000000,   -- from 00:00
-      @active_end_time      = 235959;   -- to 23:59
+      @schedule_name     = N'SFTP_BlueYonderAptos_Daily_0200',
+      @enabled           = 1,
+      @freq_type         = 4,        -- daily
+      @freq_interval     = 1,
+      @freq_subday_type  = 1,        -- 1 = at the specified time (once)
+      @active_start_time = 020000;   -- 02:00:00
 --------------------------------------------------------------------------------
 
   USEFUL OPERATIONS
