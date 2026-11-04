@@ -84,7 +84,7 @@ param(
     [string]$CredentialFolder = 'D:\sftp\creds',
     [string]$StagingPath      = 'D:\sftp\staging',
     [string]$LogPath          = 'D:\sftp\logs\blueyonder-aptos.log',
-    [string]$WinScpLogPath    = 'D:\sftp\logs\winscp-session.log',
+    [string]$WinScpLogPath    = 'D:\sftp\logs\winscp_log\winscp-session.log',
 
     # SQL Server audit database (Windows auth as the service account).
     # The audit is a HARD dependency: if SQL is unreachable the run aborts
@@ -113,8 +113,8 @@ $ErrorActionPreference = 'Stop'
 # before the extension, e.g.:
 #   D:\sftp\logs\blueyonder-aptos.log
 #     -> D:\sftp\logs\blueyonder-aptos_20261024-020003.log
-#   D:\sftp\logs\winscp-session.log
-#     -> D:\sftp\logs\winscp-session.BlueYonder_20261024-020003.log
+#   D:\sftp\logs\winscp_log\winscp-session.log
+#     -> D:\sftp\logs\winscp_log\winscp-session.BlueYonder_20261024-020003.log
 # ===========================================================================
 $script:RunStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 
@@ -394,8 +394,8 @@ function New-WinScpSession {
 
 function Get-EndpointWinScpLogPath {
     # Builds a per-endpoint, per-run WinSCP session log path from $WinScpLogPath, e.g.
-    #   D:\sftp\logs\winscp-session.log
-    #     -> D:\sftp\logs\winscp-session.BlueYonder_20261024-020003.log
+    #   D:\sftp\logs\winscp_log\winscp-session.log
+    #     -> D:\sftp\logs\winscp_log\winscp-session.BlueYonder_20261024-020003.log
     param([string]$Role)
     $dir  = Split-Path -Parent $WinScpLogPath
     $base = [System.IO.Path]::GetFileNameWithoutExtension($WinScpLogPath)
