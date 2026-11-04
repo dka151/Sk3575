@@ -49,6 +49,19 @@
     Safety switch. When supplied, the claimed source (.RN) is deleted after a
     verified delivery (a true MOVE). When omitted (default), delivery completes
     but the claimed source .RN is left in place -- nothing is deleted.
+    Keeping the .RN is recommended: it is the "already picked up" marker that
+    prevents the same file being pushed to the destination twice.
+
+.PARAMETER SqlServer
+.PARAMETER SqlDatabase
+    SQL Server audit database. Every file gets a row in
+    dbo.BlueYonderAptos_TransferAudit and one row per step in
+    dbo.BlueYonderAptos_TransferAuditStepDetail. The audit is mandatory: if SQL
+    is unreachable, or any audit write fails, the run HALTS (no file fallback).
+    File outcomes: Success | Warning (delivered, .RN delete failed) |
+    Failed (before claim; source untouched, retried next run) |
+    Stranded (claimed, not delivered; .RN KEPT, manual review needed).
+    The script exits 1 if any file is Failed or Stranded.
 
 .PARAMETER WhatIf
     Dry run: logs what each flow WOULD transfer without moving anything.
@@ -72,6 +85,17 @@ param(
     [string]$StagingPath      = 'D:\sftp\staging',
     [string]$LogPath          = 'D:\sftp\logs\blueyonder-aptos.log',
     [string]$WinScpLogPath    = 'D:\sftp\logs\winscp-session.log',
+
+    # SQL Server audit database (Windows auth as the service account).
+    # The audit is a HARD dependency: if SQL is unreachable the run aborts
+    # before any file is transferred. There is NO file fallback.
+    # Tables: dbo.BlueYonderAptos_TransferAudit and
+    #         dbo.BlueYonderAptos_TransferAuditStepDetail
+    #         (create with Create_BlueYonderAptos_TransferAudit.sql).
+    # Defaults to the machine running this script (SQL Agent and the audit DB are
+    # on the same server). For a named instance pass e.g. -SqlServer "$env:COMPUTERNAME\INST01".
+    [string]$SqlServer   = $env:COMPUTERNAME,
+    [string]$SqlDatabase = 'DBA',
 
     # Safety switch. When supplied, the claimed source file (renamed to .RN during
     # pickup) is DELETED after a verified delivery -- a true MOVE, matching the
@@ -168,6 +192,160 @@ function Write-Log {
     try { Add-Content -Path $LogPath -Value $line -ErrorAction Stop } catch { }
 }
 
+# ---------------------------------------------------------------------------
+# SQL audit helpers. Any failure here sets $script:AuditFatal and THROWS; the
+# per-file catch re-throws it so the whole run halts. By design no file may be
+# moved without its audit trail.
+# ---------------------------------------------------------------------------
+$script:RunId          = [guid]::NewGuid()
+$script:AuditConn      = $null
+$script:AuditFatal     = $false
+$script:FailedCount    = 0    # files that failed BEFORE the source was claimed
+$script:StrandedCount  = 0    # files claimed (.RN kept) but not delivered
+
+function Stop-OnAuditError {
+    param([string]$Message)
+    $script:AuditFatal = $true
+    throw "AUDIT: $Message"
+}
+
+function Open-AuditConnection {
+    if ($SqlServer -like 'TODO*' -or $SqlDatabase -like 'TODO*') {
+        throw "SqlServer/SqlDatabase are not configured. Set -SqlServer and -SqlDatabase. Transfers are halted without an audit database."
+    }
+    $cs = "Server=$SqlServer;Database=$SqlDatabase;Integrated Security=SSPI;Connect Timeout=15;Application Name=Sync-BlueYonder-Aptos"
+    $conn = New-Object System.Data.SqlClient.SqlConnection $cs
+    try {
+        $conn.Open()
+        foreach ($t in 'dbo.BlueYonderAptos_TransferAudit', 'dbo.BlueYonderAptos_TransferAuditStepDetail') {
+            $cmd = $conn.CreateCommand()
+            $cmd.CommandText = "SELECT TOP (0) 1 FROM $t"
+            [void]$cmd.ExecuteScalar()
+        }
+    }
+    catch {
+        $conn.Dispose()
+        throw "Audit database unavailable ($SqlServer/$SqlDatabase). Transfers halted. Error: $($_.Exception.Message)"
+    }
+    $script:AuditConn = $conn
+    Write-Log "Audit database connected: $SqlServer/$SqlDatabase (RunId $($script:RunId))"
+}
+
+function Start-AuditRecord {
+    param(
+        [string]$Direction, [string]$FlowName, [string]$FileName, $SizeBytes,
+        [string]$SourceHost, [string]$SourcePath, [string]$DestHost, [string]$DestPath
+    )
+    $cmd = $script:AuditConn.CreateCommand()
+    $cmd.CommandTimeout = 30
+    $cmd.CommandText = @'
+INSERT INTO dbo.BlueYonderAptos_TransferAudit
+    (RunId, Direction, FlowName, FileName, SizeBytes, SourceHost, SourcePath, DestHost, DestPath,
+     Status, TransferStartUtc, RunHost, RunUser)
+OUTPUT INSERTED.AuditId
+VALUES
+    (@RunId, @Direction, @FlowName, @FileName, @SizeBytes, @SourceHost, @SourcePath, @DestHost, @DestPath,
+     'InProgress', SYSUTCDATETIME(), @RunHost, @RunUser)
+'@
+    [void]$cmd.Parameters.AddWithValue('@RunId',      $script:RunId)
+    [void]$cmd.Parameters.AddWithValue('@Direction',  $Direction)
+    [void]$cmd.Parameters.AddWithValue('@FlowName',   $FlowName)
+    [void]$cmd.Parameters.AddWithValue('@FileName',   $FileName)
+    [void]$cmd.Parameters.AddWithValue('@SizeBytes',  $(if ($null -ne $SizeBytes) { [int64]$SizeBytes } else { [DBNull]::Value }))
+    [void]$cmd.Parameters.AddWithValue('@SourceHost', $SourceHost)
+    [void]$cmd.Parameters.AddWithValue('@SourcePath', $SourcePath)
+    [void]$cmd.Parameters.AddWithValue('@DestHost',   $DestHost)
+    [void]$cmd.Parameters.AddWithValue('@DestPath',   $DestPath)
+    [void]$cmd.Parameters.AddWithValue('@RunHost',    $env:COMPUTERNAME)
+    [void]$cmd.Parameters.AddWithValue('@RunUser',    "$env:USERDOMAIN\$env:USERNAME")
+    try { return [int64]$cmd.ExecuteScalar() }
+    catch { Stop-OnAuditError "insert failed for '$FileName'; run halted before transfer. $($_.Exception.Message)" }
+}
+
+function Complete-AuditRecord {
+    param([int64]$AuditId, [string]$Status, [string]$ErrorMessage, [int]$DurationMs)
+    $cmd = $script:AuditConn.CreateCommand()
+    $cmd.CommandTimeout = 30
+    $cmd.CommandText = @'
+UPDATE dbo.BlueYonderAptos_TransferAudit
+   SET Status = @Status, ErrorMessage = @ErrorMessage, DurationMs = @DurationMs,
+       TransferEndUtc = SYSUTCDATETIME()
+ WHERE AuditId = @AuditId
+'@
+    [void]$cmd.Parameters.AddWithValue('@Status',       $Status)
+    [void]$cmd.Parameters.AddWithValue('@ErrorMessage', $(if ($ErrorMessage) { $ErrorMessage } else { [DBNull]::Value }))
+    [void]$cmd.Parameters.AddWithValue('@DurationMs',   $DurationMs)
+    [void]$cmd.Parameters.AddWithValue('@AuditId',      $AuditId)
+    try { [void]$cmd.ExecuteNonQuery() }
+    catch { Stop-OnAuditError "update failed for AuditId $AuditId (status '$Status'); run halted. $($_.Exception.Message)" }
+}
+
+function Add-StepRecord {
+    # Inserts a step row. Status 'InProgress' (updated later by Complete-StepRecord)
+    # or a final status such as 'Skipped' (written complete in one shot).
+    param(
+        [int64]$AuditId, [int]$StepNo, [string]$StepName, [string]$StepHost,
+        [string]$FromPath, [string]$ToPath, [string]$Status = 'InProgress'
+    )
+    $cmd = $script:AuditConn.CreateCommand()
+    $cmd.CommandTimeout = 30
+    $cmd.CommandText = @'
+INSERT INTO dbo.BlueYonderAptos_TransferAuditStepDetail
+    (AuditId, StepNo, StepName, Host, FromPath, ToPath, Status, StepStartUtc, StepEndUtc, DurationMs)
+OUTPUT INSERTED.StepId
+VALUES
+    (@AuditId, @StepNo, @StepName, @Host, @FromPath, @ToPath, @Status, SYSUTCDATETIME(),
+     CASE WHEN @Status = 'InProgress' THEN NULL ELSE SYSUTCDATETIME() END,
+     CASE WHEN @Status = 'InProgress' THEN NULL ELSE 0 END)
+'@
+    [void]$cmd.Parameters.AddWithValue('@AuditId',  $AuditId)
+    [void]$cmd.Parameters.AddWithValue('@StepNo',   [byte]$StepNo)
+    [void]$cmd.Parameters.AddWithValue('@StepName', $StepName)
+    [void]$cmd.Parameters.AddWithValue('@Host',     $(if ($StepHost) { $StepHost } else { [DBNull]::Value }))
+    [void]$cmd.Parameters.AddWithValue('@FromPath', $(if ($FromPath) { $FromPath } else { [DBNull]::Value }))
+    [void]$cmd.Parameters.AddWithValue('@ToPath',   $(if ($ToPath)   { $ToPath }   else { [DBNull]::Value }))
+    [void]$cmd.Parameters.AddWithValue('@Status',   $Status)
+    try { return [int64]$cmd.ExecuteScalar() }
+    catch { Stop-OnAuditError "step insert failed (AuditId $AuditId, $StepName); run halted. $($_.Exception.Message)" }
+}
+
+function Complete-StepRecord {
+    param([int64]$StepId, [string]$Status, [string]$ErrorMessage, [int]$DurationMs)
+    $cmd = $script:AuditConn.CreateCommand()
+    $cmd.CommandTimeout = 30
+    $cmd.CommandText = @'
+UPDATE dbo.BlueYonderAptos_TransferAuditStepDetail
+   SET Status = @Status, ErrorMessage = @ErrorMessage, DurationMs = @DurationMs,
+       StepEndUtc = SYSUTCDATETIME()
+ WHERE StepId = @StepId
+'@
+    [void]$cmd.Parameters.AddWithValue('@Status',       $Status)
+    [void]$cmd.Parameters.AddWithValue('@ErrorMessage', $(if ($ErrorMessage) { $ErrorMessage } else { [DBNull]::Value }))
+    [void]$cmd.Parameters.AddWithValue('@DurationMs',   $DurationMs)
+    [void]$cmd.Parameters.AddWithValue('@StepId',       $StepId)
+    try { [void]$cmd.ExecuteNonQuery() }
+    catch { Stop-OnAuditError "step update failed (StepId $StepId, '$Status'); run halted. $($_.Exception.Message)" }
+}
+
+function Invoke-AuditedStep {
+    # Runs one step of the file journey with a write-ahead step record:
+    #   InProgress row -> run $Action -> Success/Failed update.
+    # Audit errors halt the run (fatal); a failing $Action is re-thrown to the caller.
+    param(
+        [int64]$AuditId, [int]$StepNo, [string]$StepName, [string]$StepHost,
+        [string]$FromPath, [string]$ToPath, [scriptblock]$Action
+    )
+    $stepId  = Add-StepRecord -AuditId $AuditId -StepNo $StepNo -StepName $StepName `
+                              -StepHost $StepHost -FromPath $FromPath -ToPath $ToPath
+    $stepSw  = [System.Diagnostics.Stopwatch]::StartNew()
+    $stepErr = $null
+    try { & $Action | Out-Null } catch { $stepErr = $_.Exception.Message }
+    $stepSw.Stop()
+    Complete-StepRecord -StepId $stepId -Status $(if ($stepErr) { 'Failed' } else { 'Success' }) `
+                        -ErrorMessage $stepErr -DurationMs ([int]$stepSw.ElapsedMilliseconds)
+    if ($stepErr) { throw $stepErr }
+}
+
 function Get-StoredCredential {
     param([string]$Path, [string]$Role)
     if (-not (Test-Path $Path)) {
@@ -203,8 +381,8 @@ function New-WinScpSession {
 
     $session = New-Object WinSCP.Session
     # Each endpoint gets its OWN session log file so one session never appends to
-    # another's log. Files are already deleted in preflight, so each is written
-    # fresh, once, per run.
+    # another's log. Every log name carries the run timestamp, so each file is
+    # written fresh, once, per run.
     if ($WinScpLogPath) {
         $session.SessionLogPath = Get-EndpointWinScpLogPath -Role $Role
     }
@@ -230,9 +408,10 @@ function Invoke-TransferFlow {
     param(
         [string]$Name,
         [string]$Tag,             # short label for the log prefix (INVOICES / ASN / EXPORTPO)
-        [WinSCP.Session]$SourceSession, [string]$SourceDir,
-        [WinSCP.Session]$DestSession,   [string]$DestDir,
-        [string]$Pattern
+        [WinSCP.Session]$SourceSession, [string]$SourceDir, [string]$SourceHost,
+        [WinSCP.Session]$DestSession,   [string]$DestDir,   [string]$DestHost,
+        [string]$Pattern,
+        [string]$Direction        # BY_TO_APTOS | APTOS_TO_BY (audit column)
     )
 
     $script:FlowTag = $Tag
@@ -250,6 +429,7 @@ function Invoke-TransferFlow {
     }
     catch {
         Write-Log "listDirectory(): FAILED to list '$SourceDir': $($_.Exception.Message)" 'ERROR'
+        $script:FailedCount++   # makes the run exit non-zero
         return
     }
 
@@ -263,13 +443,15 @@ function Invoke-TransferFlow {
     $transferOpts.TransferMode = [WinSCP.TransferMode]::Binary
 
     $count = 0
-    foreach ($file in $remoteItems) {
-        $name          = $file.Name
-        $remoteSrcPath = ($SourceDir.TrimEnd('/')) + '/' + $name
-        $localPath     = Join-Path $StagingPath $name
-        $remoteDstPath = ($DestDir.TrimEnd('/')) + '/' + $name
+    $localHost = $env:COMPUTERNAME
 
-        if (-not $PSCmdlet.ShouldProcess($name, "Transfer ($Name)")) {
+    foreach ($file in $remoteItems) {
+        $fileName      = $file.Name   # NB: not $name -- PowerShell is case-insensitive and would clobber the $Name parameter
+        $remoteSrcPath = ($SourceDir.TrimEnd('/')) + '/' + $fileName
+        $localPath     = Join-Path $StagingPath $fileName
+        $remoteDstPath = ($DestDir.TrimEnd('/')) + '/' + $fileName
+
+        if (-not $PSCmdlet.ShouldProcess($fileName, "Transfer ($Name)")) {
             Write-Log "[WhatIf] Would transfer $remoteSrcPath -> $remoteDstPath"
             continue
         }
@@ -277,100 +459,142 @@ function Invoke-TransferFlow {
         # Legacy DataExchange/JDA transfer pattern (from the original job logs):
         #
         #  PICKUP (source):  download to local .TMP, rename remote source to .RN
-        #                    (claim it), rename local .TMP to final, delete .RN.
+        #                    (claim it), rename local .TMP to final.
         #  DELIVERY (dest):  upload to remote .TMP, then rename remote .TMP to the
         #                    final name so the receiving app never sees a partial file.
         #
-        # Both directions are a MOVE: the source file is consumed after success.
-        $localTmp       = $localPath + '.TMP'
-        $remoteSrcRN    = $remoteSrcPath + '.RN'    # claimed/renamed source on the source server
-        $remoteDstTmp   = $remoteDstPath + '.TMP'   # in-progress upload name on the destination
+        # The claimed source (.RN) is KEPT on the source server and is NEVER renamed
+        # back: it is the "already picked up" marker that guarantees the same file is
+        # not pushed to the destination twice. If anything fails after the claim the
+        # file is recorded as 'Stranded' and must be reviewed/reprocessed manually.
+        $localTmp     = $localPath + '.TMP'
+        $remoteSrcRN  = $remoteSrcPath + '.RN'    # claimed/renamed source on the source server
+        $remoteDstTmp = $remoteDstPath + '.TMP'   # in-progress upload name on the destination
 
-        $srcHost = $SourceSession.SessionOptions.HostName
-        $dstHost = $DestSession.SessionOptions.HostName
+        # Write-ahead audit header. If this throws (SQL down) it is NOT swallowed:
+        # the run halts and this file has not been touched.
+        $auditId = Start-AuditRecord -Direction $Direction -FlowName $Name -FileName $fileName `
+            -SizeBytes $file.Length -SourceHost $SourceHost -SourcePath $remoteSrcPath `
+            -DestHost $DestHost -DestPath $remoteDstPath
+
+        $fileSw      = [System.Diagnostics.Stopwatch]::StartNew()
+        $status      = 'Failed'
+        $errMsg      = $null
+        $currentStep = ''
+        $claimed     = $false   # source renamed to .RN
+        $delivered   = $false   # final file verified on destination
 
         try {
             # 1. Download source -> local .TMP.
-            try {
+            $currentStep = 'DownloadToLocalTmp'
+            Invoke-AuditedStep -AuditId $auditId -StepNo 1 -StepName $currentStep -StepHost $SourceHost `
+                -FromPath $remoteSrcPath -ToPath $localTmp -Action {
                 $SourceSession.GetFiles($remoteSrcPath, $localTmp, $false, $transferOpts).Check()
-                Write-Log "getFile(): Successfully received file from $remoteSrcPath to $localTmp on machine $srcHost"
-            }
-            catch {
-                Write-Log "getFile(): FAILED to receive $remoteSrcPath from machine ${srcHost}: $($_.Exception.Message)" 'ERROR'
-                continue
-            }
-
-            if (-not (Test-Path $localTmp)) {
-                Write-Log "getFile(): download produced no local file: $localTmp" 'ERROR'
-                continue
+                if (-not (Test-Path $localTmp)) { throw "download produced no local file: $localTmp" }
+                Write-Log "getFile(): Successfully received file from $remoteSrcPath to $localTmp on machine $SourceHost"
             }
 
             # 2. Claim the source by renaming it to .RN on the source server.
-            try {
+            $currentStep = 'ClaimSourceRN'
+            Invoke-AuditedStep -AuditId $auditId -StepNo 2 -StepName $currentStep -StepHost $SourceHost `
+                -FromPath $remoteSrcPath -ToPath $remoteSrcRN -Action {
                 $SourceSession.MoveFile($remoteSrcPath, $remoteSrcRN)
                 Write-Log "renameRemoteFile(): Successfully renamed $remoteSrcPath to $remoteSrcRN"
             }
-            catch {
-                Write-Log "renameRemoteFile(): FAILED to rename source $remoteSrcPath to $remoteSrcRN on machine ${srcHost}: $($_.Exception.Message)" 'ERROR'
-                continue
-            }
+            $claimed = $true   # from here on the .RN stays on the source no matter what
 
             # 3. Rename local .TMP to its final name (download now complete).
-            if (Test-Path $localPath) { Remove-Item $localPath -Force -ErrorAction SilentlyContinue }
-            Rename-Item -Path $localTmp -NewName $name
-            Write-Log "Successfully renamed local file from $localTmp to $localPath"
+            $currentStep = 'RenameLocalTmpToFinal'
+            Invoke-AuditedStep -AuditId $auditId -StepNo 3 -StepName $currentStep -StepHost $localHost `
+                -FromPath $localTmp -ToPath $localPath -Action {
+                if (Test-Path $localPath) { Remove-Item $localPath -Force }
+                Rename-Item -Path $localTmp -NewName $fileName
+                Write-Log "Successfully renamed local file from $localTmp to $localPath"
+            }
 
             # 4. Upload local file to a remote .TMP name on the destination.
-            try {
+            $currentStep = 'UploadToRemoteTmp'
+            Invoke-AuditedStep -AuditId $auditId -StepNo 4 -StepName $currentStep -StepHost $DestHost `
+                -FromPath $localPath -ToPath $remoteDstTmp -Action {
                 $DestSession.PutFiles($localPath, $remoteDstTmp, $false, $transferOpts).Check()
-                Write-Log "sendFile(): Successfully sent file from $localPath to $remoteDstTmp on machine $dstHost"
-            }
-            catch {
-                Write-Log "sendFile(): FAILED to send $localPath to $remoteDstTmp on machine ${dstHost}: $($_.Exception.Message)" 'ERROR'
-                Write-Log "sendFile(): check that the destination folder '$DestDir' exists on $dstHost and the login has write access." 'ERROR'
-                continue
+                Write-Log "sendFile(): Successfully sent file from $localPath to $remoteDstTmp on machine $DestHost"
             }
 
             # 5. Rename remote .TMP to the final name (atomic reveal).
-            try {
+            $currentStep = 'RenameRemoteTmpToFinal'
+            Invoke-AuditedStep -AuditId $auditId -StepNo 5 -StepName $currentStep -StepHost $DestHost `
+                -FromPath $remoteDstTmp -ToPath $remoteDstPath -Action {
                 $DestSession.MoveFile($remoteDstTmp, $remoteDstPath)
-                Write-Log "renameRemoteFile(): Successfully renamed $remoteDstTmp to $remoteDstPath on machine $dstHost"
-            }
-            catch {
-                Write-Log "renameRemoteFile(): FAILED to rename $remoteDstTmp to $remoteDstPath on machine ${dstHost}: $($_.Exception.Message)" 'ERROR'
-                continue
+                Write-Log "renameRemoteFile(): Successfully renamed $remoteDstTmp to $remoteDstPath on machine $DestHost"
             }
 
-            if (-not $DestSession.FileExists($remoteDstPath)) {
-                Write-Log "Delivery verification FAILED: $remoteDstPath not found on destination $dstHost." 'ERROR'
-                continue
+            # 6. Verify the final file exists on the destination.
+            $currentStep = 'VerifyDestination'
+            Invoke-AuditedStep -AuditId $auditId -StepNo 6 -StepName $currentStep -StepHost $DestHost `
+                -FromPath $remoteDstPath -ToPath $remoteDstPath -Action {
+                if (-not $DestSession.FileExists($remoteDstPath)) {
+                    throw "delivery verification failed: $remoteDstPath not found on destination $DestHost"
+                }
+                Write-Log "Delivered to destination: $remoteDstPath on machine $DestHost"
             }
-            Write-Log "Delivered to destination: $remoteDstPath on machine $dstHost"
+            $delivered = $true
+            $status    = 'Success'
 
-            # 6. Remove the claimed source file (.RN) from the source server.
-            #    Gated behind -DeleteSourceAfter as a safety measure.
+            # 7. Delete the claimed source (.RN) -- ONLY with -DeleteSourceAfter.
+            #    Default: keep it, so the file can never be pushed twice.
             if ($DeleteSourceAfter) {
+                $currentStep = 'DeleteSourceRN'
                 try {
-                    $SourceSession.RemoveFiles($remoteSrcRN).Check()
-                    Write-Log "removeRemoteFile(): Successfully deleted file $remoteSrcRN"
+                    Invoke-AuditedStep -AuditId $auditId -StepNo 7 -StepName $currentStep -StepHost $SourceHost `
+                        -FromPath $remoteSrcRN -ToPath $null -Action {
+                        $SourceSession.RemoveFiles($remoteSrcRN).Check()
+                        Write-Log "removeRemoteFile(): Successfully deleted file $remoteSrcRN"
+                    }
                 }
                 catch {
-                    Write-Log "removeRemoteFile(): FAILED to delete $remoteSrcRN on machine ${srcHost}: $($_.Exception.Message)" 'ERROR'
+                    if ($script:AuditFatal) { throw }
+                    $status = 'Warning'
+                    $errMsg = "Delivered, but delete of $remoteSrcRN failed: $($_.Exception.Message)"
+                    Write-Log "removeRemoteFile(): FAILED to delete $remoteSrcRN on machine ${SourceHost}: $($_.Exception.Message)" 'ERROR'
                 }
             }
             else {
-                Write-Log "DeleteSourceAfter not set; leaving claimed source in place: $remoteSrcRN"
+                [void](Add-StepRecord -AuditId $auditId -StepNo 7 -StepName 'DeleteSourceRN' -StepHost $SourceHost `
+                    -FromPath $remoteSrcRN -ToPath $null -Status 'Skipped')
+                Write-Log "DeleteSourceAfter not set; keeping claimed source on the source server: $remoteSrcRN"
             }
-
-            $count++
         }
         catch {
-            Write-Log "Unexpected error transferring '$name': $($_.Exception.Message)" 'ERROR'
+            # An audit (SQL) failure must halt the whole run, not just this file.
+            if ($script:AuditFatal) { throw }
+
+            $errMsg = "Step $currentStep failed: $($_.Exception.Message)"
+            if ($claimed) {
+                # Source is claimed but delivery did not complete. Keep the .RN (no rollback).
+                $status = 'Stranded'
+                $errMsg += " | Source kept as $remoteSrcRN (no rollback, to avoid duplicate delivery). Check '$DestDir' on $DestHost for $fileName / $fileName.TMP before reprocessing manually."
+                Write-Log "STRANDED '$fileName': $errMsg" 'ERROR'
+            }
+            else {
+                $status = 'Failed'
+                Write-Log "FAILED '$fileName' (source untouched, will be retried next run): $errMsg" 'ERROR'
+            }
         }
         finally {
             # Always clean up any local staging copies (.TMP and final).
             if (Test-Path $localTmp)  { Remove-Item $localTmp  -Force -ErrorAction SilentlyContinue }
             if (Test-Path $localPath) { Remove-Item $localPath -Force -ErrorAction SilentlyContinue }
+        }
+
+        $fileSw.Stop()
+        # Outside the try/catch on purpose: an audit failure here must halt the run.
+        Complete-AuditRecord -AuditId $auditId -Status $status -ErrorMessage $errMsg -DurationMs ([int]$fileSw.ElapsedMilliseconds)
+
+        switch ($status) {
+            'Success'  { $count++ }
+            'Warning'  { $count++ }
+            'Stranded' { $script:StrandedCount++ }
+            'Failed'   { $script:FailedCount++ }
         }
     }
 
@@ -398,6 +622,9 @@ $byeSession   = $null
 $aptosSession = $null
 
 try {
+    # Audit DB first: if SQL is down, halt before any SFTP connection or transfer.
+    Open-AuditConnection
+
     $byeSession   = New-WinScpSession -Endpoint $BlueYonder -Role 'Blue Yonder'
     $aptosSession = New-WinScpSession -Endpoint $Aptos      -Role 'Aptos'
 
@@ -406,17 +633,17 @@ try {
         # destination per filename pattern (invoices, ASN, ...).
         foreach ($route in $OutboundRoutes) {
             Invoke-TransferFlow -Name "$($route.Label) Blue Yonder -> Aptos" -Tag $route.Tag `
-                -SourceSession $byeSession   -SourceDir $BlueYonder.OutboxPath `
-                -DestSession   $aptosSession -DestDir   $route.DestPath `
-                -Pattern $route.Pattern
+                -SourceSession $byeSession   -SourceDir $BlueYonder.OutboxPath -SourceHost $BlueYonder.HostName `
+                -DestSession   $aptosSession -DestDir   $route.DestPath        -DestHost   $Aptos.HostName `
+                -Pattern $route.Pattern -Direction 'BY_TO_APTOS'
         }
     }
 
     if ($Mode -in @('Both', 'PosOnly')) {
         Invoke-TransferFlow -Name 'PURCHASE ORDERS Aptos -> Blue Yonder' -Tag 'EXPORTPO' `
-            -SourceSession $aptosSession -SourceDir $Aptos.PurchaseOutPath `
-            -DestSession   $byeSession   -DestDir   $BlueYonder.InboxPath `
-            -Pattern $PoPattern
+            -SourceSession $aptosSession -SourceDir $Aptos.PurchaseOutPath -SourceHost $Aptos.HostName `
+            -DestSession   $byeSession   -DestDir   $BlueYonder.InboxPath  -DestHost   $BlueYonder.HostName `
+            -Pattern $PoPattern -Direction 'APTOS_TO_BY'
     }
 
     Write-Log "All requested flows completed."
@@ -429,6 +656,13 @@ catch {
 finally {
     if ($byeSession)   { $byeSession.Dispose();   Write-Log "Closed Blue Yonder session." }
     if ($aptosSession) { $aptosSession.Dispose(); Write-Log "Closed Aptos session." }
+    if ($script:AuditConn) { $script:AuditConn.Dispose(); Write-Log "Closed audit database connection." }
 }
 
+# Per-file problems must not look like success to SQL Agent / Task Scheduler.
+if ($script:FailedCount -gt 0 -or $script:StrandedCount -gt 0) {
+    $script:FlowTag = 'SUMMARY'
+    Write-Log "Run finished WITH ERRORS: $($script:FailedCount) failed (will retry), $($script:StrandedCount) stranded (.RN kept on source, manual review needed)." 'ERROR'
+    exit 1
+}
 exit 0
