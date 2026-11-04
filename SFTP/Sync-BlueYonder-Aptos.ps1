@@ -121,7 +121,7 @@ $BlueYonder = @{
     HostName       = 'PRODB2BGW02.jdadelivers.com'
     PortNumber     = 22
     CredFile       = Join-Path $CredentialFolder 'blueyonder.cred.xml'
-    SshHostKey     = 'TODO-PASTE-BLUEYONDER-HOSTKEY-FINGERPRINT'   # scan with WinSCP ScanFingerprint (see header) for PRODB2BGW02.jdadelivers.com
+    SshHostKey     = 'ssh-rsa 2048 7UaHQyXXDmku5LJPXpSWKT0uDBI7SkvTde1GPW3CdTU='   # scan with WinSCP ScanFingerprint (see header) for PRODB2BGW02.jdadelivers.com
     OutboxPath     = '/home/eurorpatprdv2/outbox'   # invoices come FROM here (absolute, uses login-user home)
     InboxPath      = '/home/eurorpatprdv2/inbox'    # POs go TO here (absolute, uses login-user home)
 }
@@ -131,7 +131,7 @@ $Aptos = @{
     HostName        = '10.252.16.100'
     PortNumber      = 22
     CredFile        = Join-Path $CredentialFolder 'aptos.cred.xml'
-    SshHostKey      = 'TODO-PASTE-APTOS-HOSTKEY-FINGERPRINT'       # scan with WinSCP ScanFingerprint (see header) for 10.252.16.100
+    SshHostKey      = 'ssh-rsa 2048 XUxWwtGxrm0TQQThOq1HeVHxlZIsVKNzQgjNZQtc/es='       # scan with WinSCP ScanFingerprint (see header) for 10.252.16.100
     InvoicesInPath  = '/IN/Merch/Invoices/Company1'      # invoices (STSIMATIN*.go) go TO here
     AsnInPath       = '/IN/Merch/EDI ASN'               # ASNs (STSIMASN*.go) go TO here (note the space)
     PurchaseOutPath = '/Out/Merch/PurchaseOrder'         # POs come FROM here
@@ -146,7 +146,7 @@ $OutboundRoutes = @(
 )
 
 # Aptos -> Blue Yonder purchase orders.
-$PoPattern = '*'   # purchase orders from Aptos
+$PoPattern = 'ExportPO-Co1*.xml'   # purchase orders from Aptos
 
 # ===========================================================================
 # IMPLEMENTATION  --  no edits needed below
