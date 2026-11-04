@@ -24,6 +24,8 @@
 
     Grant the service account INSERT, UPDATE and SELECT on both tables.
 */
+USE DBA
+GO
 IF OBJECT_ID('dbo.BlueYonderAptos_TransferAudit', 'U') IS NULL
 BEGIN
     CREATE TABLE dbo.BlueYonderAptos_TransferAudit
