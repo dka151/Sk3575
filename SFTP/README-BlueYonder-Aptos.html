@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Blue Yonder &#8596; Aptos SFTP Transfer — Runbook</title>
+<style>
+  :root { --fg:#24292f; --muted:#57606a; --border:#d0d7de; --bg:#ffffff;
+           --accent:#0969da; --code-bg:#f6f8fa; }
+  * { box-sizing:border-box; }
+  body { font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;
+          color:var(--fg); background:#f3f4f6; margin:0; line-height:1.6; }
+  .page { max-width:960px; margin:32px auto; background:var(--bg);
+           border:1px solid var(--border); border-radius:8px;
+           padding:40px 56px; box-shadow:0 1px 3px rgba(0,0,0,.08); }
+  h1 { font-size:30px; border-bottom:2px solid var(--border); padding-bottom:12px; margin-top:0; }
+  h2 { font-size:22px; border-bottom:1px solid var(--border); padding-bottom:6px; margin-top:34px; }
+  h3 { font-size:17px; margin-top:26px; }
+  p, li { font-size:14.5px; }
+  a { color:var(--accent); text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  code { background:var(--code-bg); padding:.15em .4em; border-radius:4px;
+          font-family:"SF Mono",Menlo,Consolas,monospace; font-size:85%; }
+  pre { background:var(--code-bg); border:1px solid var(--border); border-radius:6px;
+         padding:14px 16px; overflow:auto; font-size:13px; }
+  pre code { background:none; padding:0; }
+  table { border-collapse:collapse; width:100%; margin:16px 0; font-size:13.5px; }
+  th, td { border:1px solid var(--border); padding:7px 11px; text-align:left; vertical-align:top; }
+  th { background:#f0f3f6; }
+  tr:nth-child(even) td { background:#fafbfc; }
+  blockquote { margin:16px 0; padding:8px 16px; border-left:4px solid var(--accent);
+                background:#f0f6ff; color:var(--muted); border-radius:0 4px 4px 0; }
+  blockquote p { margin:4px 0; }
+  hr { border:none; border-top:1px solid var(--border); margin:28px 0; }
+  .meta { color:var(--muted); font-size:12px; margin-top:48px; border-top:1px solid var(--border); padding-top:12px; }
+</style>
+</head>
+<body>
+<div class="page">
+<h1 id="blue-yonder-aptos-sftp-transfer-runbook">Blue Yonder ↔ Aptos SFTP Transfer — Runbook</h1>
+<p>Replacement for the legacy DataExchange/JDA SFTP job. Moves files between the
+Blue Yonder and Aptos SFTP servers, brokered through <strong>vwpsftp01</strong> (which has
+WinSCP installed and network access to both endpoints).</p>
+<div class="codehilite" style="background: #f8f8f8"><pre style="line-height: 125%;"><span></span><code>Blue Yonder SFTP  &lt;--&gt;  vwpsftp01 (staging, WinSCP)  &lt;--&gt;  Aptos SFTP
+</code></pre></div>
+
+<p>SFTP cannot stream directly between two remote servers, so vwpsftp01 downloads
+each file to a local staging folder, uploads it to the other server, verifies
+it, and (optionally) deletes the source copy after a verified delivery.</p>
+<p>Every file transfer is audited to <strong>SQL Server</strong> (one row per file plus one row
+per step). The audit is a <strong>hard dependency</strong>: if SQL Server is unreachable the
+run aborts before any file is moved — there is no file-based fallback.</p>
+<h2 id="transfer-pattern-per-file">Transfer pattern (per file)</h2>
+<p>Each file follows the legacy DataExchange/JDA pattern so a receiving app never
+sees a partial file, and the same file is never delivered twice:</p>
+<ol>
+<li><strong>DownloadToLocalTmp</strong> — download source → local <code>&lt;file&gt;.TMP</code></li>
+<li><strong>ClaimSourceRN</strong> — rename the remote source to <code>&lt;file&gt;.RN</code> (the "claim")</li>
+<li><strong>RenameLocalTmpToFinal</strong> — rename local <code>&lt;file&gt;.TMP</code> → <code>&lt;file&gt;</code></li>
+<li><strong>UploadToRemoteTmp</strong> — upload local file → remote <code>&lt;file&gt;.TMP</code></li>
+<li><strong>RenameRemoteTmpToFinal</strong> — rename remote <code>&lt;file&gt;.TMP</code> → <code>&lt;file&gt;</code> (atomic reveal)</li>
+<li><strong>VerifyDestination</strong> — confirm the final file exists on the destination</li>
+<li><strong>DeleteSourceRN</strong> — delete <code>&lt;file&gt;.RN</code> on the source — <strong>only</strong> with <code>-DeleteSourceAfter</code></li>
+</ol>
+<blockquote>
+<p><strong>The claimed source (<code>.RN</code>) is KEPT by default and is never renamed back.</strong>
+It is the "already picked up" marker that guarantees a file is not pushed to
+the destination twice. If a failure happens <em>after</em> the claim, the file is
+recorded as <strong>Stranded</strong> and must be reviewed and reprocessed manually.</p>
+</blockquote>
+<h2 id="flows">Flows</h2>
+<p>Blue Yonder → Aptos is <strong>table-driven</strong> via <code>$OutboundRoutes</code> in the script —
+add a row to route another filename pattern from the same outbox to its own
+Aptos destination.</p>
+<table>
+<thead>
+<tr>
+<th>Flow</th>
+<th>Direction</th>
+<th>Source</th>
+<th>Pattern</th>
+<th>Destination</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Invoices</td>
+<td>BY → Aptos</td>
+<td>Blue Yonder <code>.../outbox</code></td>
+<td><code>STSIMATIN*.go</code></td>
+<td>Aptos <code>/IN/Merch/Invoices/Company1</code></td>
+</tr>
+<tr>
+<td>ASN</td>
+<td>BY → Aptos</td>
+<td>Blue Yonder <code>.../outbox</code></td>
+<td><code>STSIMASN*.go</code></td>
+<td>Aptos <code>/IN/Merch/EDI ASN</code></td>
+</tr>
+<tr>
+<td>Purchase Orders</td>
+<td>Aptos → BY</td>
+<td>Aptos <code>/Out/Merch/PurchaseOrder</code></td>
+<td><code>ExportPO-Co1*.xml</code></td>
+<td>Blue Yonder <code>.../inbox</code></td>
+</tr>
+</tbody>
+</table>
+<p><code>-Mode InvoicesOnly</code> runs <strong>all</strong> Blue Yonder → Aptos routes (invoices <em>and</em>
+ASN); <code>-Mode PosOnly</code> runs the Aptos → Blue Yonder flow; <code>-Mode Both</code> (default)
+runs everything.</p>
+<h2 id="endpoints">Endpoints</h2>
+<table>
+<thead>
+<tr>
+<th></th>
+<th>Blue Yonder</th>
+<th>Aptos</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Host</td>
+<td><code>PRODB2BGW02.jdadelivers.com</code></td>
+<td><code>10.252.16.100</code></td>
+</tr>
+<tr>
+<td>Port</td>
+<td>22</td>
+<td>22</td>
+</tr>
+<tr>
+<td>User</td>
+<td><code>eurorpatprdv2</code> (CONFIRM spelling vs path <code>europatprdv2</code>)</td>
+<td><code>WSsftpuser</code></td>
+</tr>
+<tr>
+<td>Outbox / PO source</td>
+<td><code>/home/eurorpatprdv2/outbox</code></td>
+<td><code>/Out/Merch/PurchaseOrder</code></td>
+</tr>
+<tr>
+<td>Inbox / invoice dest</td>
+<td><code>/home/eurorpatprdv2/inbox</code></td>
+<td><code>/IN/Merch/Invoices/Company1</code>, <code>/IN/Merch/EDI ASN</code></td>
+</tr>
+</tbody>
+</table>
+<blockquote>
+<p>Passwords are never stored in the scripts. They live in DPAPI-encrypted
+credential files created in step 4.</p>
+</blockquote>
+<h2 id="files">Files</h2>
+<p>Deploy the PowerShell to <code>D:\sftp\</code> on vwpsftp01; run the SQL on the audit server.</p>
+<p><strong>PowerShell (vwpsftp01):</strong>
+- <code>Sync-BlueYonder-Aptos.ps1</code> — the transfer job (audits to SQL)
+- <code>New-BlueYonderAptosCreds.ps1</code> — one-time credential file creator
+- <code>Register-BlueYonderAptosTask.ps1</code> — registers the scheduled task
+- <code>Move-WinScpLogs.ps1</code> — one-time migration of old WinSCP logs into <code>winscp_log\</code></p>
+<p><strong>SQL (audit server — database <code>DBA</code>):</strong>
+- <code>Create_BlueYonderAptos_TransferAudit.sql</code> — creates the two audit tables
+- <code>Create_usp_BlueYonderAptos_TransferReport.sql</code> — HTML email report stored procedure</p>
+<p>Suggested layout on vwpsftp01:</p>
+<div class="codehilite" style="background: #f8f8f8"><pre style="line-height: 125%;"><span></span><code>D:\sftp\
+  Sync-BlueYonder-Aptos.ps1
+  New-BlueYonderAptosCreds.ps1
+  Register-BlueYonderAptosTask.ps1
+  Move-WinScpLogs.ps1
+  creds\                 &lt;- DPAPI credential files (step 4)
+  staging\               &lt;- transient; files pass through here
+  logs\                  &lt;- per-run script logs (blueyonder-aptos_&lt;timestamp&gt;.log)
+    winscp_log\          &lt;- per-run, per-endpoint WinSCP session logs
+</code></pre></div>
+
+<h3 id="logging">Logging</h3>
+<p>Every run writes its <strong>own timestamped</strong> log files — nothing is overwritten or
+appended, so each run is preserved:</p>
+<ul>
+<li>Script log: <code>D:\sftp\logs\blueyonder-aptos_&lt;yyyyMMdd-HHmmss&gt;.log</code></li>
+<li>WinSCP session logs: <code>D:\sftp\logs\winscp_log\winscp-session.&lt;Endpoint&gt;_&lt;yyyyMMdd-HHmmss&gt;.log</code></li>
+</ul>
+<p>There is no automatic retention — add a cleanup job to cap how many old logs are
+kept (see <strong>Operations → Log retention</strong>).</p>
+<h2 id="sql-server-audit">SQL Server audit</h2>
+<p>Two tables in the <code>DBA</code> database (created by
+<code>Create_BlueYonderAptos_TransferAudit.sql</code>):</p>
+<ul>
+<li><strong><code>dbo.BlueYonderAptos_TransferAudit</code></strong> — one row per file per attempt.</li>
+<li><strong><code>dbo.BlueYonderAptos_TransferAuditStepDetail</code></strong> — one row per step per file.</li>
+</ul>
+<p>File status values:</p>
+<table>
+<thead>
+<tr>
+<th>Status</th>
+<th>Meaning</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>InProgress</code></td>
+<td>Row written, transfer underway. Lingers only if the run crashed mid-file — investigate.</td>
+</tr>
+<tr>
+<td><code>Success</code></td>
+<td>Delivered and verified on the destination.</td>
+</tr>
+<tr>
+<td><code>Warning</code></td>
+<td>Delivered, but the <code>.RN</code> delete failed (only possible with <code>-DeleteSourceAfter</code>).</td>
+</tr>
+<tr>
+<td><code>Failed</code></td>
+<td>Failed <strong>before</strong> the source was claimed. Source untouched; the next run retries it.</td>
+</tr>
+<tr>
+<td><code>Stranded</code></td>
+<td>Claimed (<code>.RN</code> kept) but delivery did not complete. <strong>Not</strong> retried automatically — review and reprocess manually. Alert on this.</td>
+</tr>
+</tbody>
+</table>
+<p>The script <strong>exits 1</strong> if any file ends <code>Failed</code> or <code>Stranded</code>, so SQL Agent /
+Task Scheduler marks the run as failed.</p>
+<h2 id="one-time-setup">One-time setup</h2>
+<h3 id="1-prerequisites">1. Prerequisites</h3>
+<ul>
+<li>WinSCP installed (default: <code>C:\Program Files (x86)\WinSCP\WinSCPnet.dll</code>).
+  If installed elsewhere, edit <code>$WinScpDllPath</code> in <code>Sync-BlueYonder-Aptos.ps1</code>.</li>
+<li>A service account to run the task (e.g. <code>DOMAIN\svc-sftp</code>) with "Log on as a batch job" right.</li>
+<li>SQL Server reachable from vwpsftp01, with the <code>DBA</code> database and the audit
+  tables created. The service account needs a SQL login + DB user in <code>DBA</code> with
+  <code>INSERT</code>, <code>UPDATE</code>, <code>SELECT</code> on both audit tables.</li>
+</ul>
+<h3 id="2-create-the-audit-tables">2. Create the audit tables</h3>
+<p>On the audit SQL Server, with <code>DBA</code> as the current database:</p>
+<div class="codehilite" style="background: #f8f8f8"><pre style="line-height: 125%;"><span></span><code><span style="color: #3D7B7B; font-style: italic">-- run Create_BlueYonderAptos_TransferAudit.sql</span>
+</code></pre></div>
+
+<p>Then grant the service account (example):</p>
+<div class="codehilite" style="background: #f8f8f8"><pre style="line-height: 125%;"><span></span><code>USE<span style="color: #BBB"> </span>DBA;
+<span style="color: #008000; font-weight: bold">CREATE</span><span style="color: #BBB"> </span><span style="color: #008000; font-weight: bold">USER</span><span style="color: #BBB"> </span>[<span style="color: #008000; font-weight: bold">DOMAIN</span><span style="border: 1px solid #F00">\</span>svc<span style="color: #666">-</span>sftp]<span style="color: #BBB"> </span><span style="color: #008000; font-weight: bold">FOR</span><span style="color: #BBB"> </span>LOGIN<span style="color: #BBB"> </span>[<span style="color: #008000; font-weight: bold">DOMAIN</span><span style="border: 1px solid #F00">\</span>svc<span style="color: #666">-</span>sftp];
+<span style="color: #008000; font-weight: bold">GRANT</span><span style="color: #BBB"> </span><span style="color: #008000; font-weight: bold">INSERT</span>,<span style="color: #BBB"> </span><span style="color: #008000; font-weight: bold">UPDATE</span>,<span style="color: #BBB"> </span><span style="color: #008000; font-weight: bold">SELECT</span><span style="color: #BBB"> </span><span style="color: #008000; font-weight: bold">ON</span><span style="color: #BBB"> </span>dbo.BlueYonderAptos_TransferAudit<span style="color: #BBB">           </span><span style="color: #008000; font-weight: bold">TO</span><span style="color: #BBB"> </span>[<span style="color: #008000; font-weight: bold">DOMAIN</span><span style="border: 1px solid #F00">\</span>svc<span style="color: #666">-</span>sftp];
+<span style="color: #008000; font-weight: bold">GRANT</span><span style="color: #BBB"> </span><span style="color: #008000; font-weight: bold">INSERT</span>,<span style="color: #BBB"> </span><span style="color: #008000; font-weight: bold">UPDATE</span>,<span style="color: #BBB"> </span><span style="color: #008000; font-weight: bold">SELECT</span><span style="color: #BBB"> </span><span style="color: #008000; font-weight: bold">ON</span><span style="color: #BBB"> </span>dbo.BlueYonderAptos_TransferAuditStepDetail<span style="color: #BBB"> </span><span style="color: #008000; font-weight: bold">TO</span><span style="color: #BBB"> </span>[<span style="color: #008000; font-weight: bold">DOMAIN</span><span style="border: 1px solid #F00">\</span>svc<span style="color: #666">-</span>sftp];
+</code></pre></div>
+
+<h3 id="3-confirm-connectivity">3. Confirm connectivity</h3>
+<div class="codehilite" style="background: #f8f8f8"><pre style="line-height: 125%;"><span></span><code><span style="color: #008000">Test-NetConnection</span> -ComputerName 10.252.16.100              -Port 22
+<span style="color: #008000">Test-NetConnection</span> -ComputerName PRODB2BGW02.jdadelivers.com -Port 22
+</code></pre></div>
+
+<p>Both must show <code>TcpTestSucceeded : True</code>. If Aptos fails, raise a firewall
+request: source = vwpsftp01 IP, destination = <code>10.252.16.100</code>, port 22/TCP.</p>
+<h3 id="4-capture-ssh-host-key-fingerprints-then-paste-into-the-script">4. Capture SSH host key fingerprints, then paste into the script</h3>
+<p>Use the WinSCP .NET assembly's <code>ScanFingerprint</code> (no credentials needed).
+Run ONE HOST AT A TIME so pasted line breaks can't merge statements.</p>
+<p>Blue Yonder:</p>
+<div class="codehilite" style="background: #f8f8f8"><pre style="line-height: 125%;"><span></span><code><span style="color: #008000">Add-Type</span> -Path <span style="color: #BA2121">"C:\Program Files (x86)\WinSCP\WinSCPnet.dll"</span>
+<span style="color: #19177C">$opts</span> = <span style="color: #008000">New-Object</span> WinSCP.SessionOptions -Property @{ Protocol = <span style="color: #800">[WinSCP.Protocol]</span>::Sftp; HostName = <span style="color: #BA2121">'PRODB2BGW02.jdadelivers.com'</span>; PortNumber = 22 }
+<span style="color: #19177C">$session</span> = <span style="color: #008000">New-Object</span> WinSCP.Session
+<span style="color: #19177C">$session</span>.ScanFingerprint(<span style="color: #19177C">$opts</span>, <span style="color: #BA2121">'SHA-256'</span>)
+<span style="color: #19177C">$session</span>.Dispose()
+</code></pre></div>
+
+<p>Aptos (only after the step 3 port test passes):</p>
+<div class="codehilite" style="background: #f8f8f8"><pre style="line-height: 125%;"><span></span><code><span style="color: #19177C">$opts</span> = <span style="color: #008000">New-Object</span> WinSCP.SessionOptions -Property @{ Protocol = <span style="color: #800">[WinSCP.Protocol]</span>::Sftp; HostName = <span style="color: #BA2121">'10.252.16.100'</span>; PortNumber = 22 }
+<span style="color: #19177C">$session</span> = <span style="color: #008000">New-Object</span> WinSCP.Session
+<span style="color: #19177C">$session</span>.ScanFingerprint(<span style="color: #19177C">$opts</span>, <span style="color: #BA2121">'SHA-256'</span>)
+<span style="color: #19177C">$session</span>.Dispose()
+</code></pre></div>
+
+<p>Put each returned fingerprint into the matching <code>SshHostKey</code> field in
+<code>Sync-BlueYonder-Aptos.ps1</code>. This pins the server identity and prevents
+man-in-the-middle connections.</p>
+<blockquote>
+<p>Note: <code>/keygen /scanhostkey</code> is NOT valid — <code>/keygen</code> only converts key files.
+Scanning requires TCP reachability, so scan Aptos only after step 3 passes.</p>
+</blockquote>
+<h3 id="5-create-encrypted-credential-files-as-the-service-account">5. Create encrypted credential files AS THE SERVICE ACCOUNT</h3>
+<p>DPAPI ties each file to the creating user + machine, so this MUST run as the
+service account on vwpsftp01:</p>
+<div class="codehilite" style="background: #f8f8f8"><pre style="line-height: 125%;"><span></span><code>runas /user:DOMAIN\svc-sftp powershell.exe
+<span style="color: #3D7B7B; font-style: italic"># in the new window:</span>
+<span style="color: #008000">cd </span>D:\sftp
+.\<span style="color: #008000">New-BlueYonderAptosCreds</span>.ps1 -OutputFolder <span style="color: #BA2121">'D:\sftp\creds'</span>
+</code></pre></div>
+
+<p>Produces <code>D:\sftp\creds\blueyonder.cred.xml</code> and <code>aptos.cred.xml</code>.
+Lock down <code>D:\sftp\creds</code> so only the service account and admins can read it.</p>
+<h3 id="6-test-before-scheduling">6. Test before scheduling</h3>
+<p>Run as the service account. <code>-WhatIf</code> still checks the SQL connection (it will
+abort if SQL is down) but writes no audit rows and moves no files:</p>
+<div class="codehilite" style="background: #f8f8f8"><pre style="line-height: 125%;"><span></span><code><span style="color: #008000">cd </span>D:\sftp
+.\<span style="color: #008000">Sync-BlueYonder</span>-Aptos.ps1 -WhatIf              <span style="color: #3D7B7B; font-style: italic"># lists what WOULD move, moves nothing</span>
+.\<span style="color: #008000">Sync-BlueYonder</span>-Aptos.ps1                      <span style="color: #3D7B7B; font-style: italic"># real run, delivers; keeps claimed source (.RN)</span>
+.\<span style="color: #008000">Sync-BlueYonder</span>-Aptos.ps1 -DeleteSourceAfter   <span style="color: #3D7B7B; font-style: italic"># real run, MOVE (deletes source .RN after verified delivery)</span>
+</code></pre></div>
+
+<p>Check the latest <code>D:\sftp\logs\blueyonder-aptos_*.log</code>, confirm files landed on
+both sides, and confirm rows appear in <code>dbo.BlueYonderAptos_TransferAudit</code>.</p>
+<blockquote>
+<p>Keeping the <code>.RN</code> (default, no <code>-DeleteSourceAfter</code>) is the recommended mode:
+it prevents duplicate delivery. Only use <code>-DeleteSourceAfter</code> if the source
+folder must be emptied and you accept that behaviour.</p>
+</blockquote>
+<h3 id="7-register-the-scheduled-task-as-administrator">7. Register the scheduled task (as administrator)</h3>
+<div class="codehilite" style="background: #f8f8f8"><pre style="line-height: 125%;"><span></span><code><span style="color: #008000">cd </span>D:\sftp
+.\<span style="color: #008000">Register-BlueYonderAptosTask</span>.ps1 -ServiceAccount <span style="color: #BA2121">'DOMAIN\svc-sftp'</span> `
+    -ScriptPath <span style="color: #BA2121">'D:\sftp\Sync-BlueYonder-Aptos.ps1'</span> `
+    -StartTime <span style="color: #BA2121">'02:00'</span> -RepeatMinutes 15
+</code></pre></div>
+
+<p>Edit the script's <code>$scriptArgs</code> to change mode / delete behaviour.</p>
+<h3 id="8-if-upgrading-migrate-old-winscp-logs">8. (If upgrading) migrate old WinSCP logs</h3>
+<p>If earlier runs wrote WinSCP logs directly into <code>D:\sftp\logs</code>, move them into
+the new <code>winscp_log</code> subfolder once:</p>
+<div class="codehilite" style="background: #f8f8f8"><pre style="line-height: 125%;"><span></span><code><span style="color: #008000">cd </span>D:\sftp
+.\<span style="color: #008000">Move-WinScpLogs</span>.ps1 -WhatIf     <span style="color: #3D7B7B; font-style: italic"># preview</span>
+.\<span style="color: #008000">Move-WinScpLogs</span>.ps1             <span style="color: #3D7B7B; font-style: italic"># move</span>
+</code></pre></div>
+
+<h3 id="9-email-reporting-optional-but-recommended">9. Email reporting (optional but recommended)</h3>
+<p>On the audit SQL Server, create the report stored procedure:</p>
+<div class="codehilite" style="background: #f8f8f8"><pre style="line-height: 125%;"><span></span><code><span style="color: #3D7B7B; font-style: italic">-- run Create_usp_BlueYonderAptos_TransferReport.sql  (in the DBA database)</span>
+</code></pre></div>
+
+<p>It emails an HTML audit report via Database Mail (profile <strong><code>DBAAlert</code></strong> by
+default) for files whose transfer started in the last N hours.</p>
+<div class="codehilite" style="background: #f8f8f8"><pre style="line-height: 125%;"><span></span><code><span style="color: #3D7B7B; font-style: italic">-- last 8 hours</span>
+<span style="color: #008000; font-weight: bold">EXEC</span><span style="color: #BBB"> </span>dbo.usp_BlueYonderAptos_SendTransferReport<span style="color: #BBB"> </span><span style="color: #666">@</span>LookbackHours<span style="color: #BBB"> </span><span style="color: #666">=</span><span style="color: #BBB"> </span><span style="color: #666">8</span>,<span style="color: #BBB">  </span><span style="color: #666">@</span>Recipients<span style="color: #BBB"> </span><span style="color: #666">=</span><span style="color: #BBB"> </span>N<span style="color: #BA2121">'dba-team@yourco.com'</span>;
+<span style="color: #3D7B7B; font-style: italic">-- last 24 hours, preview only (prints HTML, sends nothing)</span>
+<span style="color: #008000; font-weight: bold">EXEC</span><span style="color: #BBB"> </span>dbo.usp_BlueYonderAptos_SendTransferReport<span style="color: #BBB"> </span><span style="color: #666">@</span>LookbackHours<span style="color: #BBB"> </span><span style="color: #666">=</span><span style="color: #BBB"> </span><span style="color: #666">24</span>,<span style="color: #BBB"> </span><span style="color: #666">@</span>Recipients<span style="color: #BBB"> </span><span style="color: #666">=</span><span style="color: #BBB"> </span>N<span style="color: #BA2121">'dba-team@yourco.com'</span>,<span style="color: #BBB"> </span><span style="color: #666">@</span>Debug<span style="color: #BBB"> </span><span style="color: #666">=</span><span style="color: #BBB"> </span><span style="color: #666">1</span>;
+</code></pre></div>
+
+<p>The report lookback is measured against <strong><code>TransferStartUtc</code></strong> (when each
+transfer began). Common schedules: one SQL Agent job per window (8 / 12 / 24h).
+Requirements: Database Mail configured, the <code>DBAAlert</code> profile accessible to the
+job account, and that account in the msdb <code>DatabaseMailUserRole</code>.</p>
+<h2 id="operations">Operations</h2>
+<div class="codehilite" style="background: #f8f8f8"><pre style="line-height: 125%;"><span></span><code><span style="color: #3D7B7B; font-style: italic"># Inspect the scheduled task</span>
+<span style="color: #008000">Get-ScheduledTask</span> -TaskName <span style="color: #BA2121">'BlueYonder-Aptos SFTP Transfer'</span> | <span style="color: #008000">Get-ScheduledTaskInfo</span>
+<span style="color: #3D7B7B; font-style: italic"># Run on demand</span>
+<span style="color: #008000">Start-ScheduledTask</span> -TaskName <span style="color: #BA2121">'BlueYonder-Aptos SFTP Transfer'</span>
+<span style="color: #3D7B7B; font-style: italic"># Latest logs (per-run timestamped files)</span>
+<span style="color: #008000">Get-ChildItem</span> D:\sftp\logs\blueyonder-aptos_*.log        | <span style="color: #008000">Sort </span>LastWriteTime | <span style="color: #008000">Select </span>-Last 1 | <span style="color: #008000">Get-Content</span> -Tail 50
+<span style="color: #008000">Get-ChildItem</span> D:\sftp\logs\winscp_log\winscp-session.*   | <span style="color: #008000">Sort </span>LastWriteTime | <span style="color: #008000">Select </span>-Last 1 | <span style="color: #008000">Get-Content</span> -Tail 50
+</code></pre></div>
+
+<h3 id="run-modes">Run modes</h3>
+<div class="codehilite" style="background: #f8f8f8"><pre style="line-height: 125%;"><span></span><code>.\<span style="color: #008000">Sync-BlueYonder</span>-Aptos.ps1 -Mode InvoicesOnly    <span style="color: #3D7B7B; font-style: italic"># all Blue Yonder -&gt; Aptos routes (invoices + ASN)</span>
+.\<span style="color: #008000">Sync-BlueYonder</span>-Aptos.ps1 -Mode PosOnly         <span style="color: #3D7B7B; font-style: italic"># Aptos -&gt; Blue Yonder only</span>
+.\<span style="color: #008000">Sync-BlueYonder</span>-Aptos.ps1 -Mode Both            <span style="color: #3D7B7B; font-style: italic"># default</span>
+</code></pre></div>
+
+<h3 id="audit-reporting-queries">Audit / reporting queries</h3>
+<div class="codehilite" style="background: #f8f8f8"><pre style="line-height: 125%;"><span></span><code><span style="color: #3D7B7B; font-style: italic">-- recent files</span>
+<span style="color: #008000; font-weight: bold">SELECT</span><span style="color: #BBB"> </span>TOP<span style="color: #BBB"> </span><span style="color: #666">100</span><span style="color: #BBB"> </span>TransferStartUtc,<span style="color: #BBB"> </span>Direction,<span style="color: #BBB"> </span>FileName,<span style="color: #BBB"> </span>Status,<span style="color: #BBB"> </span>DurationMs,<span style="color: #BBB"> </span>ErrorMessage
+<span style="color: #008000; font-weight: bold">FROM</span><span style="color: #BBB"> </span>dbo.BlueYonderAptos_TransferAudit<span style="color: #BBB"> </span><span style="color: #008000; font-weight: bold">ORDER</span><span style="color: #BBB"> </span><span style="color: #008000; font-weight: bold">BY</span><span style="color: #BBB"> </span>TransferStartUtc<span style="color: #BBB"> </span><span style="color: #008000; font-weight: bold">DESC</span>;
+
+<span style="color: #3D7B7B; font-style: italic">-- anything needing attention</span>
+<span style="color: #008000; font-weight: bold">SELECT</span><span style="color: #BBB"> </span><span style="color: #666">*</span><span style="color: #BBB"> </span><span style="color: #008000; font-weight: bold">FROM</span><span style="color: #BBB"> </span>dbo.BlueYonderAptos_TransferAudit
+<span style="color: #008000; font-weight: bold">WHERE</span><span style="color: #BBB"> </span>Status<span style="color: #BBB"> </span><span style="color: #008000; font-weight: bold">IN</span><span style="color: #BBB"> </span>(<span style="color: #BA2121">'Failed'</span>,<span style="color: #BA2121">'Stranded'</span>,<span style="color: #BA2121">'InProgress'</span>)<span style="color: #BBB"> </span><span style="color: #008000; font-weight: bold">ORDER</span><span style="color: #BBB"> </span><span style="color: #008000; font-weight: bold">BY</span><span style="color: #BBB"> </span>TransferStartUtc<span style="color: #BBB"> </span><span style="color: #008000; font-weight: bold">DESC</span>;
+
+<span style="color: #3D7B7B; font-style: italic">-- full step journey for one file</span>
+<span style="color: #008000; font-weight: bold">SELECT</span><span style="color: #BBB"> </span>s.StepNo,<span style="color: #BBB"> </span>s.StepName,<span style="color: #BBB"> </span>s.Status,<span style="color: #BBB"> </span>s.<span style="color: #008000; font-weight: bold">Host</span>,<span style="color: #BBB"> </span>s.FromPath,<span style="color: #BBB"> </span>s.ToPath,<span style="color: #BBB"> </span>s.DurationMs,<span style="color: #BBB"> </span>s.ErrorMessage
+<span style="color: #008000; font-weight: bold">FROM</span><span style="color: #BBB"> </span>dbo.BlueYonderAptos_TransferAuditStepDetail<span style="color: #BBB"> </span>s
+<span style="color: #008000; font-weight: bold">JOIN</span><span style="color: #BBB"> </span>dbo.BlueYonderAptos_TransferAudit<span style="color: #BBB"> </span>a<span style="color: #BBB"> </span><span style="color: #008000; font-weight: bold">ON</span><span style="color: #BBB"> </span>a.AuditId<span style="color: #BBB"> </span><span style="color: #666">=</span><span style="color: #BBB"> </span>s.AuditId
+<span style="color: #008000; font-weight: bold">WHERE</span><span style="color: #BBB"> </span>a.FileName<span style="color: #BBB"> </span><span style="color: #666">=</span><span style="color: #BBB"> </span>N<span style="color: #BA2121">'STSIMATIN12345.go'</span><span style="color: #BBB"> </span><span style="color: #008000; font-weight: bold">ORDER</span><span style="color: #BBB"> </span><span style="color: #008000; font-weight: bold">BY</span><span style="color: #BBB"> </span>s.StepNo;
+</code></pre></div>
+
+<h3 id="log-retention">Log retention</h3>
+<p>No retention is built in. Schedule a cleanup (e.g. keep 7 days). Example
+SQL Agent CmdExec step — note the two folders are listed explicitly:</p>
+<div class="codehilite" style="background: #f8f8f8"><pre style="line-height: 125%;"><span></span><code>powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command <span style="color: #BA2121">"$ret=7; $cut=(Get-Date).AddDays(-$ret); $dirs=@('D:\sftp\logs','D:\sftp\logs\winscp_log'); $patterns=@('blueyonder-aptos_*.log','winscp-session.*_*.log'); foreach($d in $dirs){ foreach($p in $patterns){ Get-ChildItem -Path $d -Filter $p -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt $cut } | ForEach-Object { Write-Host ('Deleting ' + $_.FullName); Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue } } }; exit 0"</span>
+</code></pre></div>
+
+<h2 id="troubleshooting">Troubleshooting</h2>
+<table>
+<thead>
+<tr>
+<th>Symptom</th>
+<th>Likely cause</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Run aborts immediately, "Audit database unavailable"</td>
+<td>SQL Server down/unreachable, or the audit tables/permissions are missing. By design no files move until the audit DB is reachable.</td>
+</tr>
+<tr>
+<td>File shows <code>Stranded</code></td>
+<td>Delivery failed after the source was claimed. The <code>.RN</code> is kept on the source. Check the destination for <code>&lt;file&gt;</code> / <code>&lt;file&gt;.TMP</code>, then reprocess manually.</td>
+</tr>
+<tr>
+<td>File shows <code>Failed</code></td>
+<td>Failed before the claim; source untouched. The next run retries it automatically.</td>
+</tr>
+<tr>
+<td>Rows stuck at <code>InProgress</code></td>
+<td>Run crashed mid-file (or SQL went down mid-file). Confirm the file's real state on both servers before acting.</td>
+</tr>
+<tr>
+<td><code>could not be decrypted</code> on a cred file</td>
+<td>Files created under a different account/machine. Re-run step 5 as the service account on vwpsftp01.</td>
+</tr>
+<tr>
+<td><code>SSH host key ... not set</code></td>
+<td>Step 4 not done; paste fingerprints into the script.</td>
+</tr>
+<tr>
+<td><code>TcpTestSucceeded : False</code> to Aptos</td>
+<td>Firewall/routing; raise a request for vwpsftp01 -&gt; 10.252.16.100:22.</td>
+</tr>
+<tr>
+<td>Host key mismatch at connect</td>
+<td>Server key changed or wrong fingerprint pinned. Re-scan (step 4) and confirm with the server owner.</td>
+</tr>
+<tr>
+<td>No files transferred, "No files matching"</td>
+<td>Normal for an empty outbox. Otherwise confirm the pattern and the remote paths.</td>
+</tr>
+<tr>
+<td>Report email not received</td>
+<td>Database Mail not configured, <code>DBAAlert</code> profile not accessible to the job account, or account not in msdb <code>DatabaseMailUserRole</code>.</td>
+</tr>
+</tbody>
+</table>
+<h2 id="outstanding-items-to-confirm">Outstanding items to confirm</h2>
+<ul>
+<li><strong>Username spelling:</strong> <code>eurorpatprdv2</code> (given) vs <code>europatprdv2</code> (in some paths). One likely has a typo.</li>
+<li><strong>Rotate the Blue Yonder password</strong> after go-live, since it was shared during setup.</li>
+<li><strong>Schedule cadence:</strong> confirm run time / frequency (example: 02:00, every 15 min).</li>
+<li><strong>Keep vs delete source:</strong> default keeps the claimed <code>.RN</code> (prevents duplicates). Use <code>-DeleteSourceAfter</code> only if the source must be emptied.</li>
+<li><strong>Audit server / database:</strong> defaults are the local machine and <code>DBA</code>. Override with <code>-SqlServer</code> / <code>-SqlDatabase</code> if different.</li>
+<li><strong>Report time zone:</strong> <code>@DisplayTimeZone</code> defaults to <code>GMT Standard Time</code>; set to your locale.</li>
+</ul>
+<div class="meta">Generated from README-BlueYonder-Aptos.md</div>
+</div>
+</body>
+</html>

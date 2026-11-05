@@ -8,37 +8,47 @@ WinSCP installed and network access to both endpoints).
 Blue Yonder SFTP  <-->  vwpsftp01 (staging, WinSCP)  <-->  Aptos SFTP
 ```
 
-SFTP cannot stream directly between two remote servers, so vwpsftp01 is the
-broker. Each file follows the legacy DataExchange/JDA transfer pattern:
-download to a local `.TMP`, rename the remote source to `.RN` (claim it), rename
-the local `.TMP` to its final name, upload to a remote `.TMP` on the destination,
-then rename that remote `.TMP` to the final name (atomic reveal — the receiving
-app never sees a partial file). In production the claimed source (`.RN`) is then
-deleted, making it a MOVE.
+SFTP cannot stream directly between two remote servers, so vwpsftp01 downloads
+each file to a local staging folder, uploads it to the other server, verifies
+it, and (optionally) deletes the source copy after a verified delivery.
+
+Every file transfer is audited to **SQL Server** (one row per file plus one row
+per step). The audit is a **hard dependency**: if SQL Server is unreachable the
+run aborts before any file is moved — there is no file-based fallback.
+
+## Transfer pattern (per file)
+
+Each file follows the legacy DataExchange/JDA pattern so a receiving app never
+sees a partial file, and the same file is never delivered twice:
+
+1. **DownloadToLocalTmp** — download source → local `<file>.TMP`
+2. **ClaimSourceRN** — rename the remote source to `<file>.RN` (the "claim")
+3. **RenameLocalTmpToFinal** — rename local `<file>.TMP` → `<file>`
+4. **UploadToRemoteTmp** — upload local file → remote `<file>.TMP`
+5. **RenameRemoteTmpToFinal** — rename remote `<file>.TMP` → `<file>` (atomic reveal)
+6. **VerifyDestination** — confirm the final file exists on the destination
+7. **DeleteSourceRN** — delete `<file>.RN` on the source — **only** with `-DeleteSourceAfter`
+
+> **The claimed source (`.RN`) is KEPT by default and is never renamed back.**
+> It is the "already picked up" marker that guarantees a file is not pushed to
+> the destination twice. If a failure happens *after* the claim, the file is
+> recorded as **Stranded** and must be reviewed and reprocessed manually.
 
 ## Flows
 
-| Flow | Source | Pattern | Destination |
-|------|--------|---------|-------------|
-| Invoices | Blue Yonder `PRODB2BGW02.jdadelivers.com:/home/eurorpatprdv2/outbox` | `STSIMATIN*.go` | Aptos `10.252.16.100:/IN/Merch/Invoices/Company1` |
-| ASN | Blue Yonder `PRODB2BGW02.jdadelivers.com:/home/eurorpatprdv2/outbox` | `STSIMASN*.go` | Aptos `10.252.16.100:/IN/Merch/EDI ASN` |
-| Purchase Orders | Aptos `10.252.16.100:/Out/Merch/PurchaseOrder` | `*` | Blue Yonder `PRODB2BGW02.jdadelivers.com:/home/eurorpatprdv2/inbox` |
+Blue Yonder → Aptos is **table-driven** via `$OutboundRoutes` in the script —
+add a row to route another filename pattern from the same outbox to its own
+Aptos destination.
 
-Invoices and ASN share the same Blue Yonder outbox and are routed to different
-Aptos folders by filename pattern. The routing is table-driven in the script
-(`$OutboundRoutes`) — add a row there to route another document type from the
-same outbox. (Note: the ASN destination folder name contains a space: `EDI ASN`.)
+| Flow | Direction | Source | Pattern | Destination |
+|------|-----------|--------|---------|-------------|
+| Invoices | BY → Aptos | Blue Yonder `.../outbox` | `STSIMATIN*.go` | Aptos `/IN/Merch/Invoices/Company1` |
+| ASN | BY → Aptos | Blue Yonder `.../outbox` | `STSIMASN*.go` | Aptos `/IN/Merch/EDI ASN` |
+| Purchase Orders | Aptos → BY | Aptos `/Out/Merch/PurchaseOrder` | `ExportPO-Co1*.xml` | Blue Yonder `.../inbox` |
 
-**Transfer pattern (per file, matching the legacy job logs):**
-1. `getFile()` — download source to a local `.TMP`
-2. `renameRemoteFile()` — rename remote source to `.RN` (claim it)
-3. rename local `.TMP` to its final name
-4. `sendFile()` — upload to a remote `.TMP` on the destination
-5. `renameRemoteFile()` — rename remote `.TMP` to the final name (atomic reveal)
-6. `removeRemoteFile()` — delete the claimed source `.RN` **(only when `-DeleteSourceAfter` is passed)**
-
-`-DeleteSourceAfter` is a safety switch: with it, step 6 runs (true MOVE);
-without it, delivery still completes but the claimed `.RN` is left on the source.
+`-Mode InvoicesOnly` runs **all** Blue Yonder → Aptos routes (invoices *and*
+ASN); `-Mode PosOnly` runs the Aptos → Blue Yonder flow; `-Mode Both` (default)
+runs everything.
 
 ## Endpoints
 
@@ -46,17 +56,26 @@ without it, delivery still completes but the claimed `.RN` is left on the source
 |---|-------------|-------|
 | Host | `PRODB2BGW02.jdadelivers.com` | `10.252.16.100` |
 | Port | 22 | 22 |
-| User | `eurorpatprdv2` | `WSsftpuser` |
+| User | `eurorpatprdv2` (CONFIRM spelling vs path `europatprdv2`) | `WSsftpuser` |
+| Outbox / PO source | `/home/eurorpatprdv2/outbox` | `/Out/Merch/PurchaseOrder` |
+| Inbox / invoice dest | `/home/eurorpatprdv2/inbox` | `/IN/Merch/Invoices/Company1`, `/IN/Merch/EDI ASN` |
 
 > Passwords are never stored in the scripts. They live in DPAPI-encrypted
-> credential files created in step 3.
+> credential files created in step 4.
 
-## Files (deploy these to `D:\sftp\` on vwpsftp01)
+## Files
 
-- `Sync-BlueYonder-Aptos.ps1` — the transfer job
+Deploy the PowerShell to `D:\sftp\` on vwpsftp01; run the SQL on the audit server.
+
+**PowerShell (vwpsftp01):**
+- `Sync-BlueYonder-Aptos.ps1` — the transfer job (audits to SQL)
 - `New-BlueYonderAptosCreds.ps1` — one-time credential file creator
-- `Deploy-BlueYonderAptosJob.sql` — creates the SQL Agent job (chosen scheduler)
-- `Register-BlueYonderAptosTask.ps1` — registers a Windows scheduled task (alternative scheduler)
+- `Register-BlueYonderAptosTask.ps1` — registers the scheduled task
+- `Move-WinScpLogs.ps1` — one-time migration of old WinSCP logs into `winscp_log\`
+
+**SQL (audit server — database `DBA`):**
+- `Create_BlueYonderAptos_TransferAudit.sql` — creates the two audit tables
+- `Create_usp_BlueYonderAptos_TransferReport.sql` — HTML email report stored procedure
 
 Suggested layout on vwpsftp01:
 
@@ -64,33 +83,80 @@ Suggested layout on vwpsftp01:
 D:\sftp\
   Sync-BlueYonder-Aptos.ps1
   New-BlueYonderAptosCreds.ps1
-  Deploy-BlueYonderAptosJob.sql
   Register-BlueYonderAptosTask.ps1
-  creds\      <- credential files (step 3)
-  staging\    <- transient; files pass through here
-  logs\       <- timestamped per-run logs (pruned by the job's retention step)
+  Move-WinScpLogs.ps1
+  creds\                 <- DPAPI credential files (step 4)
+  staging\               <- transient; files pass through here
+  logs\                  <- per-run script logs (blueyonder-aptos_<timestamp>.log)
+    winscp_log\          <- per-run, per-endpoint WinSCP session logs
 ```
 
-## One-time setup on vwpsftp01
+### Logging
+
+Every run writes its **own timestamped** log files — nothing is overwritten or
+appended, so each run is preserved:
+
+- Script log: `D:\sftp\logs\blueyonder-aptos_<yyyyMMdd-HHmmss>.log`
+- WinSCP session logs: `D:\sftp\logs\winscp_log\winscp-session.<Endpoint>_<yyyyMMdd-HHmmss>.log`
+
+There is no automatic retention — add a cleanup job to cap how many old logs are
+kept (see **Operations → Log retention**).
+
+## SQL Server audit
+
+Two tables in the `DBA` database (created by
+`Create_BlueYonderAptos_TransferAudit.sql`):
+
+- **`dbo.BlueYonderAptos_TransferAudit`** — one row per file per attempt.
+- **`dbo.BlueYonderAptos_TransferAuditStepDetail`** — one row per step per file.
+
+File status values:
+
+| Status | Meaning |
+|--------|---------|
+| `InProgress` | Row written, transfer underway. Lingers only if the run crashed mid-file — investigate. |
+| `Success` | Delivered and verified on the destination. |
+| `Warning` | Delivered, but the `.RN` delete failed (only possible with `-DeleteSourceAfter`). |
+| `Failed` | Failed **before** the source was claimed. Source untouched; the next run retries it. |
+| `Stranded` | Claimed (`.RN` kept) but delivery did not complete. **Not** retried automatically — review and reprocess manually. Alert on this. |
+
+The script **exits 1** if any file ends `Failed` or `Stranded`, so SQL Agent /
+Task Scheduler marks the run as failed.
+
+## One-time setup
 
 ### 1. Prerequisites
 - WinSCP installed (default: `C:\Program Files (x86)\WinSCP\WinSCPnet.dll`).
   If installed elsewhere, edit `$WinScpDllPath` in `Sync-BlueYonder-Aptos.ps1`.
 - A service account to run the task (e.g. `DOMAIN\svc-sftp`) with "Log on as a batch job" right.
+- SQL Server reachable from vwpsftp01, with the `DBA` database and the audit
+  tables created. The service account needs a SQL login + DB user in `DBA` with
+  `INSERT`, `UPDATE`, `SELECT` on both audit tables.
 
-### 2. Confirm connectivity (corrected Aptos IP)
+### 2. Create the audit tables
+On the audit SQL Server, with `DBA` as the current database:
+```sql
+-- run Create_BlueYonderAptos_TransferAudit.sql
+```
+Then grant the service account (example):
+```sql
+USE DBA;
+CREATE USER [DOMAIN\svc-sftp] FOR LOGIN [DOMAIN\svc-sftp];
+GRANT INSERT, UPDATE, SELECT ON dbo.BlueYonderAptos_TransferAudit           TO [DOMAIN\svc-sftp];
+GRANT INSERT, UPDATE, SELECT ON dbo.BlueYonderAptos_TransferAuditStepDetail TO [DOMAIN\svc-sftp];
+```
+
+### 3. Confirm connectivity
 ```powershell
-Test-NetConnection -ComputerName 10.252.16.100           -Port 22
+Test-NetConnection -ComputerName 10.252.16.100              -Port 22
 Test-NetConnection -ComputerName PRODB2BGW02.jdadelivers.com -Port 22
 ```
 Both must show `TcpTestSucceeded : True`. If Aptos fails, raise a firewall
 request: source = vwpsftp01 IP, destination = `10.252.16.100`, port 22/TCP.
 
-### 3. Capture SSH host key fingerprints, then paste into the script
+### 4. Capture SSH host key fingerprints, then paste into the script
 Use the WinSCP .NET assembly's `ScanFingerprint` (no credentials needed).
-Run ONE HOST AT A TIME so pasted line breaks can't merge statements — keep each
-`New-Object` on its own line (merging them onto one line causes
-"A positional parameter cannot be found" errors).
+Run ONE HOST AT A TIME so pasted line breaks can't merge statements.
 
 Blue Yonder:
 ```powershell
@@ -101,7 +167,7 @@ $session.ScanFingerprint($opts, 'SHA-256')
 $session.Dispose()
 ```
 
-Aptos (only after the step 2 port test passes):
+Aptos (only after the step 3 port test passes):
 ```powershell
 $opts = New-Object WinSCP.SessionOptions -Property @{ Protocol = [WinSCP.Protocol]::Sftp; HostName = '10.252.16.100'; PortNumber = 22 }
 $session = New-Object WinSCP.Session
@@ -109,30 +175,18 @@ $session.ScanFingerprint($opts, 'SHA-256')
 $session.Dispose()
 ```
 
-If you prefer a single pasteable line, separate statements with `;`:
-```powershell
-Add-Type -Path "C:\Program Files (x86)\WinSCP\WinSCPnet.dll"; $opts = New-Object WinSCP.SessionOptions -Property @{ Protocol=[WinSCP.Protocol]::Sftp; HostName='PRODB2BGW02.jdadelivers.com'; PortNumber=22 }; $session = New-Object WinSCP.Session; $session.ScanFingerprint($opts,'SHA-256'); $session.Dispose()
-```
-
-Or capture it from the WinSCP GUI: connect to the host, and on the
-"unknown server" dialog click **Copy key fingerprints to clipboard**
-(or afterwards via **Session > Server/Protocol Information**).
-
 Put each returned fingerprint into the matching `SshHostKey` field in
 `Sync-BlueYonder-Aptos.ps1`. This pins the server identity and prevents
 man-in-the-middle connections.
 
 > Note: `/keygen /scanhostkey` is NOT valid — `/keygen` only converts key files.
-> Scanning requires TCP reachability, so scan Aptos only after step 2 passes.
+> Scanning requires TCP reachability, so scan Aptos only after step 3 passes.
 
-### 4. Create encrypted credential files AS THE SERVICE ACCOUNT
+### 5. Create encrypted credential files AS THE SERVICE ACCOUNT
 DPAPI ties each file to the creating user + machine, so this MUST run as the
 service account on vwpsftp01:
-Since the SQL Agent service runs as `WSS\vwpsftp01sql`, create the files AS THAT
-ACCOUNT on vwpsftp01 (the job step will run as the same account, so DPAPI
-decryption works). Use PsExec if `runas` is blocked for the service account:
 ```powershell
-C:\Tools\PSTools\PsExec.exe -accepteula -u WSS\vwpsftp01sql -i powershell.exe
+runas /user:DOMAIN\svc-sftp powershell.exe
 # in the new window:
 cd D:\sftp
 .\New-BlueYonderAptosCreds.ps1 -OutputFolder 'D:\sftp\creds'
@@ -140,124 +194,120 @@ cd D:\sftp
 Produces `D:\sftp\creds\blueyonder.cred.xml` and `aptos.cred.xml`.
 Lock down `D:\sftp\creds` so only the service account and admins can read it.
 
-### 5. Test before scheduling
-Run as the service account (`WSS\vwpsftp01sql`):
+### 6. Test before scheduling
+Run as the service account. `-WhatIf` still checks the SQL connection (it will
+abort if SQL is down) but writes no audit rows and moves no files:
 ```powershell
 cd D:\sftp
-.\Sync-BlueYonder-Aptos.ps1 -WhatIf              # lists what WOULD transfer, moves nothing
-.\Sync-BlueYonder-Aptos.ps1                      # deliver; leave claimed source (.RN) in place (safety mode)
-.\Sync-BlueYonder-Aptos.ps1 -DeleteSourceAfter   # full MOVE: delete claimed source after verified delivery
+.\Sync-BlueYonder-Aptos.ps1 -WhatIf              # lists what WOULD move, moves nothing
+.\Sync-BlueYonder-Aptos.ps1                      # real run, delivers; keeps claimed source (.RN)
+.\Sync-BlueYonder-Aptos.ps1 -DeleteSourceAfter   # real run, MOVE (deletes source .RN after verified delivery)
 ```
-Check the latest run log (each run writes its own timestamped file,
-`D:\sftp\logs\blueyonder-aptos_<yyyyMMdd-HHmmss>.log`) and confirm files landed
-on both sides:
-```powershell
-Get-Content (Get-ChildItem D:\sftp\logs\blueyonder-aptos_*.log | Sort-Object LastWriteTime | Select-Object -Last 1) -Tail 50
-```
-Run `-DeleteSourceAfter` (the production behaviour) only once you are satisfied
-delivery is working. Note: every run claims the source by renaming it to `.RN`;
-without `-DeleteSourceAfter` those `.RN` files stay on the source until a run
-with the switch cleans them up.
+Check the latest `D:\sftp\logs\blueyonder-aptos_*.log`, confirm files landed on
+both sides, and confirm rows appear in `dbo.BlueYonderAptos_TransferAudit`.
 
-### 6. Schedule it — SQL Agent job (chosen method)
-The SQL Server Agent service runs as `WSS\vwpsftp01sql` — the same account that
-owns the credential files — so a CmdExec step runs as that account automatically
-(no proxy needed), provided the job is owned by a sysadmin login (`sa`).
+> Keeping the `.RN` (default, no `-DeleteSourceAfter`) is the recommended mode:
+> it prevents duplicate delivery. Only use `-DeleteSourceAfter` if the source
+> folder must be emptied and you accept that behaviour.
 
-Deploy the job by running the included `Deploy-BlueYonderAptosJob.sql` on the SQL
-instance on vwpsftp01:
-```powershell
-sqlcmd -S vwpsftp01 -E -i "D:\sftp\Deploy-BlueYonderAptosJob.sql"
-```
-(or open it in SSMS and execute). The script is re-runnable — it drops and
-recreates the job — and creates a two-step job plus an every-15-minutes schedule.
-
-What the script sets up:
-- Job owned by `sa` (sysadmin) so the CmdExec steps run as the Agent service
-  account `WSS\vwpsftp01sql`. No proxy/SQL credential needed. (If the job must be
-  owned by a non-sysadmin, create a CmdExec proxy bound to a `WSS\vwpsftp01sql`
-  credential instead.)
-- **Step 1 — Run transfer (both flows):** legacy `.TMP`/`.RN` pattern,
-  `-DeleteSourceAfter` passed (true MOVE — claimed source deleted after a
-  verified delivery). `exit $LASTEXITCODE` plus the script's `exit 1` on failure
-  make SQL Agent mark the step FAILED when a transfer errors.
-- **Step 2 — Log retention cleanup:** deletes timestamped log files older than
-  `@RetentionDays` (default 30) from `D:\sftp\logs`.
-
-Step flow: on Step 1 success the job proceeds to Step 2; on Step 1 failure the
-job quits reporting failure (so a transfer error is visible and cleanup is
-skipped that run — the next successful run prunes logs). Step 2 never fails the
-job, so a cleanup hiccup won't raise a false failure.
-
-To tweak behaviour, edit `Deploy-BlueYonderAptosJob.sql` before running:
-- **Retention policy:** change `DECLARE @RetentionDays int = 30;` in Step 2.
-- **Test/safety mode:** remove `-DeleteSourceAfter` from the Step 1 `@command` to
-  leave claimed `.RN` source files in place (nothing deleted).
-- **Schedule cadence:** the active schedule runs every 15 minutes. Change
-  `@freq_subday_interval` in the `sp_add_schedule` block (e.g. 30 for every 30
-  minutes), or swap in the commented daily-once block at the bottom of the SQL
-  file. Note: a 15-minute cadence produces many log files, so consider a shorter
-  `@RetentionDays` (e.g. 7).
-
-### Alternative: Windows Task Scheduler
-If you prefer Task Scheduler over SQL Agent, use the included script:
+### 7. Register the scheduled task (as administrator)
 ```powershell
 cd D:\sftp
-.\Register-BlueYonderAptosTask.ps1 -ServiceAccount 'WSS\vwpsftp01sql' `
+.\Register-BlueYonderAptosTask.ps1 -ServiceAccount 'DOMAIN\svc-sftp' `
     -ScriptPath 'D:\sftp\Sync-BlueYonder-Aptos.ps1' `
-    -StartTime '00:00' -RepeatMinutes 15
+    -StartTime '02:00' -RepeatMinutes 15
 ```
+Edit the script's `$scriptArgs` to change mode / delete behaviour.
+
+### 8. (If upgrading) migrate old WinSCP logs
+If earlier runs wrote WinSCP logs directly into `D:\sftp\logs`, move them into
+the new `winscp_log` subfolder once:
+```powershell
+cd D:\sftp
+.\Move-WinScpLogs.ps1 -WhatIf     # preview
+.\Move-WinScpLogs.ps1             # move
+```
+
+### 9. Email reporting (optional but recommended)
+On the audit SQL Server, create the report stored procedure:
+```sql
+-- run Create_usp_BlueYonderAptos_TransferReport.sql  (in the DBA database)
+```
+It emails an HTML audit report via Database Mail (profile **`DBAAlert`** by
+default) for files whose transfer started in the last N hours.
+```sql
+-- last 8 hours
+EXEC dbo.usp_BlueYonderAptos_SendTransferReport @LookbackHours = 8,  @Recipients = N'dba-team@yourco.com';
+-- last 24 hours, preview only (prints HTML, sends nothing)
+EXEC dbo.usp_BlueYonderAptos_SendTransferReport @LookbackHours = 24, @Recipients = N'dba-team@yourco.com', @Debug = 1;
+```
+The report lookback is measured against **`TransferStartUtc`** (when each
+transfer began). Common schedules: one SQL Agent job per window (8 / 12 / 24h).
+Requirements: Database Mail configured, the `DBAAlert` profile accessible to the
+job account, and that account in the msdb `DatabaseMailUserRole`.
 
 ## Operations
 
-```sql
--- Run the SQL Agent job on demand
-EXEC msdb.dbo.sp_start_job @job_name = N'BlueYonder-Aptos SFTP Transfer';
--- Check last run outcome
-SELECT j.name, h.run_date, h.run_time, h.run_status, h.message
-FROM msdb.dbo.sysjobs j
-JOIN msdb.dbo.sysjobhistory h ON h.job_id = j.job_id
-WHERE j.name = N'BlueYonder-Aptos SFTP Transfer'
-ORDER BY h.run_date DESC, h.run_time DESC;
-```
-Each run writes its OWN timestamped log files (never overwritten), named:
-```
-D:\sftp\logs\blueyonder-aptos_<yyyyMMdd-HHmmss>.log
-D:\sftp\logs\winscp-session.BlueYonder_<yyyyMMdd-HHmmss>.log
-D:\sftp\logs\winscp-session.Aptos_<yyyyMMdd-HHmmss>.log
-```
-Tail the most recent of each (same regardless of scheduler):
 ```powershell
-# Latest script log
-Get-Content (Get-ChildItem D:\sftp\logs\blueyonder-aptos_*.log          | Sort-Object LastWriteTime | Select-Object -Last 1) -Tail 50
-# Latest WinSCP session logs
-Get-Content (Get-ChildItem D:\sftp\logs\winscp-session.BlueYonder_*.log | Sort-Object LastWriteTime | Select-Object -Last 1) -Tail 50
-Get-Content (Get-ChildItem D:\sftp\logs\winscp-session.Aptos_*.log      | Sort-Object LastWriteTime | Select-Object -Last 1) -Tail 50
+# Inspect the scheduled task
+Get-ScheduledTask -TaskName 'BlueYonder-Aptos SFTP Transfer' | Get-ScheduledTaskInfo
+# Run on demand
+Start-ScheduledTask -TaskName 'BlueYonder-Aptos SFTP Transfer'
+# Latest logs (per-run timestamped files)
+Get-ChildItem D:\sftp\logs\blueyonder-aptos_*.log        | Sort LastWriteTime | Select -Last 1 | Get-Content -Tail 50
+Get-ChildItem D:\sftp\logs\winscp_log\winscp-session.*   | Sort LastWriteTime | Select -Last 1 | Get-Content -Tail 50
 ```
-Old log files are pruned automatically by the job's Step 2 (retention policy,
-default 30 days).
 
 ### Run modes
 ```powershell
-.\Sync-BlueYonder-Aptos.ps1 -Mode InvoicesOnly    # Blue Yonder -> Aptos only
+.\Sync-BlueYonder-Aptos.ps1 -Mode InvoicesOnly    # all Blue Yonder -> Aptos routes (invoices + ASN)
 .\Sync-BlueYonder-Aptos.ps1 -Mode PosOnly         # Aptos -> Blue Yonder only
 .\Sync-BlueYonder-Aptos.ps1 -Mode Both            # default
+```
+
+### Audit / reporting queries
+```sql
+-- recent files
+SELECT TOP 100 TransferStartUtc, Direction, FileName, Status, DurationMs, ErrorMessage
+FROM dbo.BlueYonderAptos_TransferAudit ORDER BY TransferStartUtc DESC;
+
+-- anything needing attention
+SELECT * FROM dbo.BlueYonderAptos_TransferAudit
+WHERE Status IN ('Failed','Stranded','InProgress') ORDER BY TransferStartUtc DESC;
+
+-- full step journey for one file
+SELECT s.StepNo, s.StepName, s.Status, s.Host, s.FromPath, s.ToPath, s.DurationMs, s.ErrorMessage
+FROM dbo.BlueYonderAptos_TransferAuditStepDetail s
+JOIN dbo.BlueYonderAptos_TransferAudit a ON a.AuditId = s.AuditId
+WHERE a.FileName = N'STSIMATIN12345.go' ORDER BY s.StepNo;
+```
+
+### Log retention
+No retention is built in. Schedule a cleanup (e.g. keep 7 days). Example
+SQL Agent CmdExec step — note the two folders are listed explicitly:
+```bat
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$ret=7; $cut=(Get-Date).AddDays(-$ret); $dirs=@('D:\sftp\logs','D:\sftp\logs\winscp_log'); $patterns=@('blueyonder-aptos_*.log','winscp-session.*_*.log'); foreach($d in $dirs){ foreach($p in $patterns){ Get-ChildItem -Path $d -Filter $p -File -ErrorAction SilentlyContinue | Where-Object { $_.LastWriteTime -lt $cut } | ForEach-Object { Write-Host ('Deleting ' + $_.FullName); Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue } } }; exit 0"
 ```
 
 ## Troubleshooting
 
 | Symptom | Likely cause |
 |---------|--------------|
-| `could not be decrypted` on a cred file | Files created under a different account/machine. Re-run step 4 as the service account on vwpsftp01. |
-| `SSH host key ... not set` | Step 3 not done; paste fingerprints into the script. |
+| Run aborts immediately, "Audit database unavailable" | SQL Server down/unreachable, or the audit tables/permissions are missing. By design no files move until the audit DB is reachable. |
+| File shows `Stranded` | Delivery failed after the source was claimed. The `.RN` is kept on the source. Check the destination for `<file>` / `<file>.TMP`, then reprocess manually. |
+| File shows `Failed` | Failed before the claim; source untouched. The next run retries it automatically. |
+| Rows stuck at `InProgress` | Run crashed mid-file (or SQL went down mid-file). Confirm the file's real state on both servers before acting. |
+| `could not be decrypted` on a cred file | Files created under a different account/machine. Re-run step 5 as the service account on vwpsftp01. |
+| `SSH host key ... not set` | Step 4 not done; paste fingerprints into the script. |
 | `TcpTestSucceeded : False` to Aptos | Firewall/routing; raise a request for vwpsftp01 -> 10.252.16.100:22. |
-| Host key mismatch at connect | Server key changed or wrong fingerprint pinned. Re-scan (step 3) and confirm with the server owner. |
-| No files transferred, "No files matching" | Pattern or folder mismatch. Confirm `STSIMATIN*.go` and the remote paths. |
+| Host key mismatch at connect | Server key changed or wrong fingerprint pinned. Re-scan (step 4) and confirm with the server owner. |
+| No files transferred, "No files matching" | Normal for an empty outbox. Otherwise confirm the pattern and the remote paths. |
+| Report email not received | Database Mail not configured, `DBAAlert` profile not accessible to the job account, or account not in msdb `DatabaseMailUserRole`. |
 
 ## Outstanding items to confirm
+- **Username spelling:** `eurorpatprdv2` (given) vs `europatprdv2` (in some paths). One likely has a typo.
 - **Rotate the Blue Yonder password** after go-live, since it was shared during setup.
-- **Schedule cadence:** currently every 15 minutes. Confirm this frequency is
-  desired (and that overlapping runs can't occur — see note below).
-- **Transfer behaviour:** production uses the legacy `.TMP`/`.RN` move pattern with
-  `-DeleteSourceAfter` (claimed source deleted after a verified delivery). Omitting
-  the switch is test/safety mode and leaves `.RN` files on the source.
+- **Schedule cadence:** confirm run time / frequency (example: 02:00, every 15 min).
+- **Keep vs delete source:** default keeps the claimed `.RN` (prevents duplicates). Use `-DeleteSourceAfter` only if the source must be emptied.
+- **Audit server / database:** defaults are the local machine and `DBA`. Override with `-SqlServer` / `-SqlDatabase` if different.
+- **Report time zone:** `@DisplayTimeZone` defaults to `GMT Standard Time`; set to your locale.
