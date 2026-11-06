@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Runbook: Aptos Style Dims Export (PROD)</title>
+<style>
+  body { font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif; line-height: 1.55; color: #1f2328; max-width: 980px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { border-bottom: 2px solid #d0d7de; padding-bottom: .3rem; }
+  h2 { border-bottom: 1px solid #d0d7de; padding-bottom: .2rem; margin-top: 2rem; }
+  table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: .95rem; }
+  th, td { border: 1px solid #d0d7de; padding: .45rem .7rem; text-align: left; vertical-align: top; }
+  th { background: #f6f8fa; }
+  code { background: #eff1f3; padding: .1rem .3rem; border-radius: 4px; font-family: Consolas, Menlo, monospace; font-size: .9em; }
+  pre { background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 6px; padding: .8rem; overflow-x: auto; }
+  pre code { background: none; padding: 0; }
+  ul.check { list-style: none; padding-left: 0; }
+  .note { background: #fff8c5; border-left: 4px solid #d4a72c; padding: .6rem .9rem; margin: 1rem 0; }
+</style>
+</head>
+<body>
+
+<h1>Runbook: Aptos Style Dims Export (PROD)</h1>
+<p>Exports style dimensions from SQL Server to a CSV and uploads it to the Aptos SFTP server.</p>
+
+<table>
+  <tr><th>Item</th><th>Value</th></tr>
+  <tr><td>SQL Server</td><td><code>AZUSW1APSQL03</code></td></tr>
+  <tr><td>Database / proc</td><td><code>DBA</code> / <code>dbo.usp_Aptos_StyleDims_Export</code> (<code>@WhId = 282999</code>)</td></tr>
+  <tr><td>Scripts</td><td><code>Export-AptosStyleDims.ps1</code>, <code>New-AptosSftpCredential.ps1</code></td></tr>
+  <tr><td>Run as</td><td><code>WSS\AzSQLService</code> (SQL Agent service account)</td></tr>
+  <tr><td>SQL Agent job</td><td><code>Aptos - Style Dims Export (PROD)</code> (CmdExec step)</td></tr>
+  <tr><td>SFTP target</td><td><code>/Transfer/IN/MERCH/Style</code></td></tr>
+  <tr><td>Working folder</td><td><code>D:\Jobs\AptosStyleDims</code></td></tr>
+  <tr><td>Credential file</td><td><code>D:\Jobs\AptosStyleDims\Secrets\aptos_sftp.cred</code></td></tr>
+</table>
+
+<h2>1. How it works</h2>
+<ol>
+  <li>Runs <code>dbo.usp_Aptos_StyleDims_Export</code> on <code>AZUSW1APSQL03</code> (Windows authentication).</li>
+  <li>Builds <code>Aptos_styledims_&lt;yyyyMMdd_HHmmss&gt;.csv</code> in <code>Work\</code>.
+    <ul>
+      <li>Header: <code>Style,Action,EntityAction,Code,Weight,Height,Width,Depth</code></li>
+      <li>CRLF line endings, UTF-8 without BOM.</li>
+      <li>Numbers use <code>.</code> and drop trailing zeros (<code>8.00</code> becomes <code>8</code>).</li>
+    </ul>
+  </li>
+  <li>Uploads through WinSCP as <code>&lt;name&gt;.csv.tmp</code>, then renames to <code>&lt;name&gt;.csv</code>, so Aptos never sees a partial file.</li>
+  <li>Moves the CSV to <code>Archive\</code>. Files in <code>Archive\</code> and <code>Logs\</code> older than 30 days are deleted.</li>
+</ol>
+<p>If the proc returns zero rows, no file is created, a WARN is logged and the job succeeds (exit 0).</p>
+<p>Exit codes: <code>0</code> success or no rows, <code>1</code> failure.</p>
+
+<h2>2. Prerequisites</h2>
+<ul>
+  <li>WinSCP installed at <code>C:\Program Files (x86)\WinSCP\winscp.com</code>.</li>
+  <li><code>WSS\AzSQLService</code> has:
+    <ul>
+      <li>Modify rights on <code>D:\Jobs\AptosStyleDims</code>.</li>
+      <li>Read and execute rights on the WinSCP folder.</li>
+      <li><code>EXECUTE</code> on <code>dbo.usp_Aptos_StyleDims_Export</code> in <code>DBA</code>.</li>
+    </ul>
+  </li>
+  <li>Aptos SFTP host name, port, user and password.</li>
+  <li>Server host key pinned in the script (<code>-HostKey</code>): <code>ssh-rsa 2048 lp0au9aqsK5yF2hlSef33/6PWNOKEzxxSUuNlN46OJk</code></li>
+</ul>
+
+<h2>3. One-time setup</h2>
+<ol>
+  <li>Copy both <code>.ps1</code> files to <code>D:\Jobs\AptosStyleDims\</code>.</li>
+  <li>Confirm <code>-SftpHost</code> is <code>10.252.17.100</code> (the script default).</li>
+  <li>Create the credential file as <code>WSS\AzSQLService</code> (admin command prompt):
+<pre><code>runas /user:WSS\AzSQLService "powershell.exe -NoProfile -ExecutionPolicy Bypass -File D:\Jobs\AptosStyleDims\New-AptosSftpCredential.ps1"</code></pre>
+    Enter the Aptos SFTP user and password when prompted.
+    <ul>
+      <li>The file is DPAPI-encrypted. Only the same account on the same server can decrypt it.</li>
+      <li>The script restricts the <code>Secrets</code> folder to that account and Administrators.</li>
+      <li>If <code>runas</code> is refused (deny log on locally), use <code>psexec -i -u WSS\AzSQLService powershell.exe</code>, or ask for the right to be lifted temporarily.</li>
+    </ul>
+    <div class="note">Do not put the SFTP password in a SQL Agent step. It would be stored in plain text.</div>
+  </li>
+  <li>Create the SQL Agent job <code>Aptos - Style Dims Export (PROD)</code>:
+    <ul>
+      <li>Owner and step run-as: <code>WSS\AzSQLService</code> (or a proxy using it).</li>
+      <li>Step type: Operating system (CmdExec).</li>
+      <li>Command:
+<pre><code>powershell.exe -NoProfile -ExecutionPolicy Bypass -File "D:\Jobs\AptosStyleDims\Export-AptosStyleDims.ps1"</code></pre>
+      </li>
+      <li>Add the schedule and a failure notification.</li>
+    </ul>
+  </li>
+</ol>
+
+<h2>4. First run checklist</h2>
+<p>Run once manually as <code>WSS\AzSQLService</code>, then start the job.</p>
+<ul class="check">
+  <li>&#9744; Log shows <code>Rows returned: N</code>.</li>
+  <li>&#9744; Log shows <code>File delivered: /Transfer/IN/MERCH/Style/Aptos_styledims_....csv</code>.</li>
+  <li>&#9744; The file is in <code>Archive\</code> and <code>Work\</code> is empty.</li>
+  <li>&#9744; The file is visible in the SFTP folder, with no leftover <code>.tmp</code>.</li>
+  <li>&#9744; Job history shows success.</li>
+</ul>
+
+<h2>5. Parameters</h2>
+<table>
+  <tr><th>Parameter</th><th>Default</th><th>Notes</th></tr>
+  <tr><td><code>-SqlServer</code></td><td><code>AZUSW1APSQL03</code></td><td></td></tr>
+  <tr><td><code>-Database</code></td><td><code>DBA</code></td><td></td></tr>
+  <tr><td><code>-WhId</code></td><td><code>282999</code></td><td>Passed to the proc</td></tr>
+  <tr><td><code>-SftpHost</code></td><td><code>10.252.17.100</code></td><td></td></tr>
+  <tr><td><code>-SftpPort</code></td><td><code>22</code></td><td></td></tr>
+  <tr><td><code>-RemoteDir</code></td><td><code>/Transfer/IN/MERCH/Style</code></td><td></td></tr>
+  <tr><td><code>-HostKey</code></td><td>pinned SHA-256</td><td><code>''</code> disables pinning</td></tr>
+  <tr><td><code>-CredFile</code></td><td><code>...\Secrets\aptos_sftp.cred</code></td><td></td></tr>
+  <tr><td><code>-WinScpPath</code></td><td><code>C:\Program Files (x86)\WinSCP\winscp.com</code></td><td></td></tr>
+  <tr><td><code>-BaseDir</code></td><td><code>D:\Jobs\AptosStyleDims</code></td><td></td></tr>
+  <tr><td><code>-FilePrefix</code></td><td><code>Aptos_styledims</code></td><td></td></tr>
+  <tr><td><code>-DateFormat</code></td><td><code>yyyyMMdd_HHmmss</code></td><td><code>yyyyMMdd</code> for one file per day</td></tr>
+  <tr><td><code>-SkipEmptyFile</code></td><td><code>$true</code></td><td></td></tr>
+  <tr><td><code>-QueryTimeoutSec</code></td><td><code>1800</code></td><td></td></tr>
+  <tr><td><code>-UploadRetries</code></td><td><code>3</code></td><td>30 s between attempts</td></tr>
+  <tr><td><code>-RetainDays</code></td><td><code>30</code></td><td>Archive and log retention</td></tr>
+</table>
+
+<h2>6. Logs and where to look</h2>
+<table>
+  <tr><th>Log</th><th>Path</th></tr>
+  <tr><td>Script log</td><td><code>D:\Jobs\AptosStyleDims\Logs\Aptos_styledims_&lt;yyyyMMdd&gt;.log</code></td></tr>
+  <tr><td>WinSCP log</td><td><code>D:\Jobs\AptosStyleDims\Logs\winscp_&lt;yyyyMMdd&gt;.log</code></td></tr>
+  <tr><td>Job history</td><td>SQL Agent &gt; job &gt; View History (step output)</td></tr>
+</table>
+<p>The WinSCP log masks the password. The temporary WinSCP script file is deleted after every upload, including failures.</p>
+
+<h2>7. Troubleshooting</h2>
+<table>
+  <tr><th>Symptom</th><th>Likely cause</th><th>Action</th></tr>
+  <tr><td><code>Credential file not found</code></td><td>Setup step 3 not done</td><td>Create the file as <code>WSS\AzSQLService</code></td></tr>
+  <tr><td>Cannot decrypt / <code>Import-Clixml</code> error</td><td>File created by another account or server</td><td>Re-run <code>New-AptosSftpCredential.ps1</code> as <code>WSS\AzSQLService</code> on this server</td></tr>
+  <tr><td><code>WinSCP not found</code></td><td>Different install path</td><td>Pass <code>-WinScpPath</code></td></tr>
+  <tr><td>WinSCP exit code 1 with host key error</td><td>Aptos rotated its key</td><td>Confirm the new fingerprint with Aptos, update <code>-HostKey</code></td></tr>
+  <tr><td>WinSCP exit code 1, authentication failed</td><td>Password changed or expired</td><td>Re-run the credential script</td></tr>
+  <tr><td>Permission denied on put/mv</td><td>SFTP user lacks write access to the folder</td><td>Ask Aptos</td></tr>
+  <tr><td>Login failed / proc permission denied</td><td>Service account lacks SQL rights</td><td>Grant <code>EXECUTE</code> on the proc</td></tr>
+  <tr><td>Timeout from SQL</td><td>Proc is slow</td><td>Increase <code>-QueryTimeoutSec</code></td></tr>
+  <tr><td><code>Rows returned: 0</code>, no file</td><td>Proc returned nothing</td><td>Check source data; expected if no changes</td></tr>
+  <tr><td>Leftover <code>.tmp</code> on SFTP</td><td>Upload interrupted</td><td>Delete it; the next run uploads a new file</td></tr>
+</table>
+
+<h2>8. Operations</h2>
+<ul>
+  <li><strong>Re-run a failed day:</strong> run the job again. It creates a new timestamped file; tell Aptos if the earlier file was partially processed.</li>
+  <li><strong>Rotate the SFTP password:</strong> run <code>New-AptosSftpCredential.ps1</code> again as <code>WSS\AzSQLService</code>. No script change is needed.</li>
+  <li><strong>Service account change or server move:</strong> the credential file stops working. Recreate it for the new account.</li>
+  <li><strong>Aptos host key rotation:</strong> update <code>-HostKey</code> after verifying the new fingerprint with Aptos.</li>
+  <li><strong>Disable temporarily:</strong> disable the SQL Agent job.</li>
+</ul>
+
+<h2>9. Security notes</h2>
+<ul>
+  <li>Credentials are DPAPI-encrypted and the folder ACL is restricted.</li>
+  <li>The password never appears on a command line or in logs.</li>
+  <li>The host key is pinned. A changed key causes the job to fail instead of connecting.</li>
+  <li>Give the SFTP user write access only to <code>/Transfer/IN/MERCH/Style</code>.</li>
+</ul>
+
+</body>
+</html>
