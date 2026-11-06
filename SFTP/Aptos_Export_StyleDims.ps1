@@ -1,7 +1,7 @@
 <#
 .SYNOPSIS
-    Runs dbo.usp_Aptos_StyleDims_Export on AZUSW1APSQL03QA and writes the
-    Aptos style dims import CSV to the "Aptos Prod Dims" folder (H:).
+    Runs dbo.usp_Aptos_StyleDims_Export on AZUSW1APSQL03QA, builds the Aptos
+    style dims import CSV, and uploads it to the Aptos SFTP folder via WinSCP.
 
 .OUTPUT FORMAT (mirrors Aptos_styledims_20261028_v6.csv)
     Style,Action,EntityAction,Code,Weight,Height,Width,Depth
@@ -10,11 +10,12 @@
     - Numbers use '.' and have trailing zeros dropped (8.00 -> 8, 3.90 -> 3.9)
     - Fields are only quoted if they contain a comma or quote
 
-.IMPORTANT - H: DRIVE
-    SQL Agent runs as a service and does NOT see mapped drive letters like H:.
-    Set -TargetDir to the UNC path that H: maps to (run "net use" on the
-    server to find it), e.g. \\fileserver\share\Aptos Prod Dims.
-    If H: is a local disk on the server, 'H:\Aptos Prod Dims' works as-is.
+.IMPORTANT - WINSCP SESSION
+    The upload uses a WinSCP *saved session* (-WinScpSession) so no password or
+    key is on the command line. Create it once on the server AS THE ACCOUNT THAT
+    RUNS THE SQL AGENT STEP (or its proxy), including host, user, auth/key and
+    host key fingerprint. WinSCP stores sessions per Windows user (registry) or
+    in an INI file; use -WinScpIni if you use an INI.
 
 .NOTES
     Called by SQL Agent job "Aptos - Style Dims Export (QA)" (CmdExec step).
@@ -22,15 +23,19 @@
 #>
 param(
     [string]$SqlServer       = 'AZUSW1APSQL03QA',
-    [string]$Database        = 'DBA',   # <<< same DB as the stored procedure
+    [string]$Database        = 'DBA',
     [string]$WhId            = '282999',
-    [string]$TargetDir       = '/Transfer/IN/MERCH/Style',   # <<< replace with UNC path if H: is mapped
+    [string]$RemoteDir       = '/Transfer/IN/MERCH/Style',
+    [string]$WinScpPath      = 'C:\Program Files (x86)\WinSCP\winscp.com',
+    [string]$WinScpSession   = 'Aptos-SFTP',            # <<< saved WinSCP session name
+    [string]$WinScpIni       = '',                       # optional: path to WinSCP.ini
+    [string]$HostKey         = 'ssh-rsa 2048 lp0au9aqsK5yF2hlSef33/6PWNOKEzxxSUuNlN46OJk',  # server host key fingerprint (SHA-256)
     [string]$BaseDir         = 'D:\Jobs\AptosStyleDims',
     [string]$FilePrefix      = 'Aptos_styledims',
-    [string]$DateFormat      = 'yyyyMMdd_HHmmss',      # 'yyyyMMdd' for one file per day
-    [switch]$SkipEmptyFile   = $true,
+    [string]$DateFormat      = 'yyyyMMdd_HHmmss',        # 'yyyyMMdd' for one file per day
+    [bool]$SkipEmptyFile     = $true,
     [int]$QueryTimeoutSec    = 1800,
-    [int]$CopyRetries        = 3,
+    [int]$UploadRetries      = 3,
     [int]$RetainDays         = 30
 )
 
@@ -51,7 +56,7 @@ foreach ($d in $archiveDir, $logDir, $workDir) {
 function Write-Log([string]$msg, [string]$level = 'INFO') {
     $line = "{0} [{1}] {2}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $level, $msg
     Add-Content -Path $logFile -Value $line
-    Write-Output $line   # also shows in SQL Agent step history
+    Write-Host $line   # also shows in SQL Agent step history
 }
 
 function ConvertTo-CsvField($value) {
@@ -66,7 +71,7 @@ function ConvertTo-CsvField($value) {
 }
 
 try {
-    Write-Log "Start. Server=$SqlServer DB=$Database WhId=$WhId Target=$TargetDir"
+    Write-Log "Start. Server=$SqlServer DB=$Database WhId=$WhId Remote=$RemoteDir Session=$WinScpSession"
 
     # ---- 1. Run extract ---------------------------------------------------
     $connStr = "Server=$SqlServer;Database=$Database;Integrated Security=SSPI;Application Name=AptosStyleDimsExport"
@@ -76,10 +81,15 @@ try {
     $cmd.CommandText    = 'dbo.usp_Aptos_StyleDims_Export'
     $cmd.CommandTimeout = $QueryTimeoutSec
     [void]$cmd.Parameters.AddWithValue('@WhId', $WhId)
-
     $table = New-Object System.Data.DataTable
-    $conn.Open()
-    try { $table.Load($cmd.ExecuteReader()) } finally { $conn.Close() }
+    try {
+        $conn.Open()
+        $reader = $cmd.ExecuteReader()
+        try { $table.Load($reader) } finally { $reader.Dispose() }
+    } finally {
+        $cmd.Dispose()
+        $conn.Dispose()
+    }
     Write-Log ("Rows returned: {0}" -f $table.Rows.Count)
 
     if ($table.Rows.Count -eq 0 -and $SkipEmptyFile) {
@@ -98,29 +108,39 @@ try {
     [System.IO.File]::WriteAllText($workFile, $sb.ToString(), (New-Object System.Text.UTF8Encoding($false)))
     Write-Log "CSV built: $workFile"
 
-    # ---- 3. Deliver to Aptos Prod Dims folder (tmp + rename) --------------
-    if (-not (Test-Path -LiteralPath $TargetDir)) {
-        throw "Target folder not reachable: $TargetDir (if H: is a mapped drive, use its UNC path)"
-    }
-    $tmpTarget   = Join-Path $TargetDir ($fileName + '.tmp')
-    $finalTarget = Join-Path $TargetDir $fileName
+    # ---- 3. Upload via WinSCP (upload as .tmp, then rename) ---------------
+    if (-not (Test-Path -LiteralPath $WinScpPath)) { throw "WinSCP not found: $WinScpPath" }
+
+    $remoteDirClean = $RemoteDir.TrimEnd('/')
+    $remoteTmp      = "$remoteDirClean/$fileName.tmp"
+    $remoteFinal    = "$remoteDirClean/$fileName"
+    $winscpLog      = Join-Path $logDir ("winscp_{0}.log" -f (Get-Date -Format 'yyyyMMdd'))
+
+    $winscpArgs = @()
+    if ($WinScpIni) { $winscpArgs += "/ini=`"$WinScpIni`"" }
+    $winscpArgs += '/log="' + $winscpLog + '"'
+    $winscpArgs += '/command'
+    $winscpArgs += 'option batch abort'
+    $winscpArgs += 'option confirm off'
+    $openCmd = "open `"$WinScpSession`""
+    if ($HostKey) { $openCmd += " -hostkey=`"$HostKey`"" }
+    $winscpArgs += $openCmd
+    $winscpArgs += "put -transfer=binary -nopreservetime -resume=off `"$workFile`" `"$remoteTmp`""
+    $winscpArgs += "mv `"$remoteTmp`" `"$remoteFinal`""
+    $winscpArgs += 'exit'
 
     $attempt = 0
     while ($true) {
         $attempt++
-        try {
-            Copy-Item -LiteralPath $workFile -Destination $tmpTarget -Force
-            if (Test-Path -LiteralPath $finalTarget) { Remove-Item -LiteralPath $finalTarget -Force }
-            Rename-Item -LiteralPath $tmpTarget -NewName $fileName -Force
-            break
-        } catch {
-            if (Test-Path -LiteralPath $tmpTarget) { Remove-Item -LiteralPath $tmpTarget -Force -ErrorAction SilentlyContinue }
-            if ($attempt -ge $CopyRetries) { throw }
-            Write-Log "Copy attempt $attempt failed: $($_.Exception.Message). Retrying in 30s." 'WARN'
-            Start-Sleep -Seconds 30
-        }
+        $out = & $WinScpPath @winscpArgs 2>&1
+        $rc  = $LASTEXITCODE
+        if ($rc -eq 0) { break }
+        Write-Log ("WinSCP exit code {0}: {1}" -f $rc, (($out | Out-String).Trim())) 'WARN'
+        if ($attempt -ge $UploadRetries) { throw "WinSCP upload failed after $attempt attempts (last exit code $rc)" }
+        Write-Log "Upload attempt $attempt failed. Retrying in 30s." 'WARN'
+        Start-Sleep -Seconds 30
     }
-    Write-Log "File delivered: $finalTarget"
+    Write-Log "File delivered: $remoteFinal"
 
     # ---- 4. Archive + housekeeping ---------------------------------------
     Move-Item -LiteralPath $workFile -Destination (Join-Path $archiveDir $fileName) -Force
