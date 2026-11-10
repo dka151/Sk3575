@@ -1,0 +1,71 @@
+USE [DBA]
+GO
+/****** Object:  StoredProcedure [dbo].[usp_Aptos_StyleDims_Export]    Script Date: 11/10/2026 9:29:58 AM ******/
+SET ANSI_NULLS ON
+GO
+SET QUOTED_IDENTIFIER ON
+GO
+
+
+ALTER   PROCEDURE [dbo].[usp_Aptos_StyleDims_Export]
+    @WhId            varchar(20) = '282999',
+    @ExcludeZeroDims bit         = 1
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    DROP TABLE IF EXISTS #items;
+    DROP TABLE IF EXISTS #styles;
+    DROP TABLE IF EXISTS #aptos_style;
+
+    /* 1. Koerber items for the warehouse */
+    SELECT  t.item_number,
+            style_code  = LEFT(t.description, CHARINDEX(':', t.description) - 1),
+            t.length,
+            t.width,
+            t.height,
+            t.unit_weight
+    INTO    #items
+    FROM    [PHXWAWSSDB2P].[AAD].[dbo].[t_item_master] t WITH (NOLOCK)
+    WHERE   t.wh_id = @WhId
+      AND   CHARINDEX(':', t.description) > 1;
+
+    /* 2. Existing Aptos styles */
+    SELECT  s.style_id,
+            s.style_code
+    INTO    #styles
+    FROM    [EPICORSQL].[me_wsl_01].[dbo].[style] s;
+
+    /* 3. One row per style, max of each dimension */
+    SELECT  s.style_id,
+            s.style_code,
+            length      = MAX(i.length),
+            width       = MAX(i.width),
+            height      = MAX(i.height),
+            unit_weight = MAX(i.unit_weight)
+    INTO    #aptos_style
+    FROM    (SELECT DISTINCT item_number, style_code, length, width, height, unit_weight
+             FROM #items) i
+    JOIN    #styles s
+            ON i.style_code COLLATE Latin1_General_BIN = s.style_code COLLATE Latin1_General_BIN
+    GROUP BY s.style_id, s.style_code;
+
+    /* 4. Final result set in Aptos import layout */
+    SELECT  [Style]        = 'Style',
+            [Action]       = 'update',
+            [EntityAction] = CAST(NULL AS varchar(10)),   -- blank in the sample
+            [Code]         = style_code,
+            [Weight]       = CAST(ROUND(ISNULL(unit_weight, 0), 2) AS decimal(18,2)),
+            [Height]       = CAST(ROUND(ISNULL(height,      0), 2) AS decimal(18,2)),
+            [Width]        = CAST(ROUND(ISNULL(width,       0), 2) AS decimal(18,2)),
+            [Depth]        = CAST(ROUND(ISNULL(length,      0), 2) AS decimal(18,2))
+    FROM    #aptos_style
+    WHERE   @ExcludeZeroDims = 0
+       OR   ISNULL(unit_weight, 0) > 0
+       OR   ISNULL(height, 0)      > 0
+       OR   ISNULL(width, 0)       > 0
+       OR   ISNULL(length, 0)      > 0
+    ORDER BY style_code;
+END
+
