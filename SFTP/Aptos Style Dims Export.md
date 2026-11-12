@@ -27,6 +27,19 @@ If the proc returns zero rows, no file is created, a WARN is logged and the job 
 
 Exit codes: `0` success or no rows, `1` failure.
 
+### Delta logic
+
+The file contains only new codes and codes whose Weight, Height, Width or Depth changed since the last successful delivery. `Style`, `Action` (`update`) and `EntityAction` (blank) are fixed values.
+
+- State is kept in `DBA.dbo.Aptos_StyleDims_Sent` (last values sent per code).
+- `usp_Aptos_StyleDims_Export` returns the delta and parks it in `dbo.Aptos_StyleDims_Pending` with a `@BatchId`.
+- After the SFTP upload succeeds, the script calls `usp_Aptos_StyleDims_Commit @BatchId`, which moves the pending rows into `Sent`. If the upload fails, nothing is committed and the next run sends the same changes again.
+- The first run (empty `Sent` table) sends every code.
+- No changes means no file and a successful job.
+- Codes are not deleted in Aptos. A code that drops out of the source, or whose four values all become 0, is simply not sent.
+- To re-send everything: run the script with `-FullExport $true`, or `TRUNCATE TABLE DBA.dbo.Aptos_StyleDims_Sent`.
+- Deploy `usp_Aptos_StyleDims_Export_Delta.sql` on `AZUSW1APSQL03` (database `DBA`) before the first run.
+
 ## 2. Prerequisites
 
 - WinSCP installed at `C:\Program Files (x86)\WinSCP\winscp.com`.

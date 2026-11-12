@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Runs dbo.usp_Aptos_StyleDims_Export on AZUSW1APSQL03QA, builds the Aptos
+    Runs dbo.usp_Aptos_StyleDims_Export on AZUSW1APSQL03, builds the Aptos
     style dims import CSV, and uploads it to the Aptos SFTP folder via WinSCP.
 
 .OUTPUT FORMAT (mirrors Aptos_styledims_20261028_v6.csv)
@@ -9,6 +9,13 @@
     - CRLF line endings, UTF-8 without BOM
     - Numbers use '.' and have trailing zeros dropped (8.00 -> 8, 3.90 -> 3.9)
     - Fields are only quoted if they contain a comma or quote
+
+.DELTA LOGIC
+    Only new codes, or codes whose Weight/Height/Width/Depth changed since the last
+    successful delivery, are exported. State lives in DBA.dbo.Aptos_StyleDims_Sent
+    and is updated by dbo.usp_Aptos_StyleDims_Commit AFTER the upload succeeds.
+    First run (empty Sent table) sends everything. Use -FullExport $true to re-seed.
+    Deploy usp_Aptos_StyleDims_Export_Delta.sql before running.
 
 .IMPORTANT - SFTP CREDENTIALS (DPAPI)
     The SFTP user/password are read from a DPAPI-encrypted file (-CredFile) that
@@ -19,16 +26,16 @@
     command line) which is deleted right after the upload.
 
 .NOTES
-    Called by SQL Agent job "Aptos - Style Dims Export (QA)" (CmdExec step).
+    Called by SQL Agent job "Aptos - Style Dims Export (PROD)" (CmdExec step).
     Exits 0 on success, 1 on failure.
 #>
 param(
-    [string]$SqlServer       = 'AZUSW1APSQL03QA',
+    [string]$SqlServer       = 'AZUSW1APSQL03',
     [string]$Database        = 'DBA',
     [string]$WhId            = '282999',
     [string]$RemoteDir       = '/Transfer/IN/MERCH/Style',
     [string]$WinScpPath      = 'C:\Program Files (x86)\WinSCP\winscp.com',
-    [string]$SftpHost        = 'REPLACE_WITH_APTOS_SFTP_HOST',   # <<< Aptos SFTP host name
+    [string]$SftpHost        = '10.252.17.100',   # Aptos SFTP host
     [int]$SftpPort           = 22,
     [string]$CredFile        = 'D:\Jobs\AptosStyleDims\Secrets\aptos_sftp.cred',
     [string]$HostKey         = 'ssh-rsa 2048 lp0au9aqsK5yF2hlSef33/6PWNOKEzxxSUuNlN46OJk',  # server host key fingerprint (SHA-256)
@@ -36,6 +43,7 @@ param(
     [string]$FilePrefix      = 'Aptos_styledims',
     [string]$DateFormat      = 'yyyyMMdd_HHmmss',        # 'yyyyMMdd' for one file per day
     [bool]$SkipEmptyFile     = $true,
+    [bool]$FullExport        = $false,                   # $true = ignore history, send every code (re-seed)
     [int]$QueryTimeoutSec    = 1800,
     [int]$UploadRetries      = 3,
     [int]$RetainDays         = 30
@@ -73,7 +81,7 @@ function ConvertTo-CsvField($value) {
 }
 
 try {
-    Write-Log "Start. Server=$SqlServer DB=$Database WhId=$WhId Remote=$RemoteDir Session=$WinScpSession"
+    Write-Log "Start. Server=$SqlServer DB=$Database WhId=$WhId Remote=$RemoteDir FullExport=$FullExport"
 
     # ---- 1. Run extract ---------------------------------------------------
     $connStr = "Server=$SqlServer;Database=$Database;Integrated Security=SSPI;Application Name=AptosStyleDimsExport"
@@ -83,19 +91,25 @@ try {
     $cmd.CommandText    = 'dbo.usp_Aptos_StyleDims_Export'
     $cmd.CommandTimeout = $QueryTimeoutSec
     [void]$cmd.Parameters.AddWithValue('@WhId', $WhId)
-    $table = New-Object System.Data.DataTable
+    [void]$cmd.Parameters.AddWithValue('@FullExport', [bool]$FullExport)
+    $pBatch = $cmd.Parameters.Add('@BatchId', [System.Data.SqlDbType]::UniqueIdentifier)
+    $pBatch.Direction = [System.Data.ParameterDirection]::Output
+    $table   = New-Object System.Data.DataTable
+    $batchId = $null
     try {
         $conn.Open()
         $reader = $cmd.ExecuteReader()
         try { $table.Load($reader) } finally { $reader.Dispose() }
+        # OUTPUT parameters are only available after the reader is closed
+        if ($pBatch.Value -isnot [System.DBNull]) { $batchId = [guid]$pBatch.Value }
     } finally {
         $cmd.Dispose()
         $conn.Dispose()
     }
-    Write-Log ("Rows returned: {0}" -f $table.Rows.Count)
+    Write-Log ("Rows returned (new/changed): {0}  BatchId={1}" -f $table.Rows.Count, $batchId)
 
     if ($table.Rows.Count -eq 0 -and $SkipEmptyFile) {
-        Write-Log 'No rows - no file created.' 'WARN'
+        Write-Log 'No new or changed styles - no file created.'
         exit 0
     }
 
@@ -160,6 +174,27 @@ try {
         $urlPwd = $null; $scriptText = $null; $openCmd = $null
     }
     Write-Log "File delivered: $remoteFinal"
+
+    # ---- 3b. Mark the delta as sent (only after successful delivery) ------
+    if ($batchId) {
+        $conn2 = New-Object System.Data.SqlClient.SqlConnection $connStr
+        $cmd2  = $conn2.CreateCommand()
+        try {
+            $cmd2.CommandType    = [System.Data.CommandType]::StoredProcedure
+            $cmd2.CommandText    = 'dbo.usp_Aptos_StyleDims_Commit'
+            $cmd2.CommandTimeout = 300
+            $p = $cmd2.Parameters.Add('@BatchId', [System.Data.SqlDbType]::UniqueIdentifier)
+            $p.Value = $batchId
+            $conn2.Open()
+            [void]$cmd2.ExecuteNonQuery()
+            Write-Log "Delta committed (BatchId=$batchId)."
+        } catch {
+            throw "File was delivered but commit failed: $($_.Exception.Message). The same rows will be re-sent on the next run."
+        } finally {
+            $cmd2.Dispose()
+            $conn2.Dispose()
+        }
+    }
 
     # ---- 4. Archive + housekeeping ---------------------------------------
     Move-Item -LiteralPath $workFile -Destination (Join-Path $archiveDir $fileName) -Force
