@@ -1,0 +1,28 @@
+SUMMARY
+
+The nightly job "TransactionDetailAndProdEDW2" has been failing in the "SalesReturnTable Aptos" data flow with "TCP Provider: An existing connection was forcibly closed by the remote host". The failure happened about 104 seconds into the pull from the Aptos source server (dbsvr1-ws-mtl). The package also logs a credential decryption error on every run. It does not cause the failure, but it is a defect.
+
+LIKELY CAUSE (to be confirmed with Network Team)
+
+The source query runs heavy aggregations over 30 days of inventory data. The Aptos server likely spends a long time computing before it returns any rows, so the connection sits idle. A firewall, VPN or NAT device between the two sites probably closes idle or long-running connections. This has not been confirmed yet, and network logs would settle it. The package also uses SQL Native Client 11, which is deprecated and gets no fixes for connection issues.
+
+RECOMMENDED CHANGES (in priority order)
+
+1. Network check (Network team, low effort)
+   Review idle and session timeouts on the path between the SSIS host and dbsvr1-ws-mtl around 05:07 on failed runs. Raise the timeout, or enable TCP keepalive on the SSIS host with an interval below the device timeout.
+
+2. Split the extract into smaller date ranges (BI/ETL dev, medium effort)
+   Pull the last 30 days in weekly or daily chunks, so rows start flowing quickly and no query runs long. This also makes retries cheaper.
+
+3. Make the load safe to rerun (ETL dev, low-medium effort)
+   The destination table SalesReturn is truncated before the load, so a failure leaves it empty. Load into a staging table and swap or merge only after success.
+
+4. Upgrade the database driver (ETL dev, low effort)
+   Move all three connection managers from SQL Native Client 11 to Microsoft OLE DB Driver for SQL Server (MSOLEDBSQL). It is supported, gets fixes, and handles encryption and reconnects better. Install it on the SSIS server and regression-test. This supports the fix but is unlikely to solve the drops alone.
+
+5. Fix credential handling (ETL dev + security, medium effort, higher priority than it looks)
+   Several passwords are stored in plain text inside the package: the Aptos connection string, the SMTP password, and a hard-coded SQL login in two script tasks. They should be rotated and moved to a secure store or job-level overrides. Set the package ProtectionLevel so it no longer depends on one user's key, which also removes the decryption error.
+
+6. Improve job resilience and visibility (DBA, low effort)
+   The job step currently retries 3 times at 5-minute intervals, but the retry restarts from the truncate step. After items 2 and 3, retries become useful. Add logging so failures are visible without searching Agent history. The package currently runs from the file system and writes nothing to the SSIS catalog.
+
