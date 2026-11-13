@@ -26,3 +26,5 @@ RECOMMENDED CHANGES (in priority order)
 6. Improve job resilience and visibility (DBA, low effort)
    The job step currently retries 3 times at 5-minute intervals, but the retry restarts from the truncate step. After items 2 and 3, retries become useful. Add logging so failures are visible without searching Agent history. The package currently runs from the file system and writes nothing to the SSIS catalog.
 
+Effort and risk:
+Items 1 and 6 are configuration only. Items 2 to 5 need package changes and testing in a non-production run first. Rotating credentials in item 5 needs coordination with the Aptos and mail administrators.
